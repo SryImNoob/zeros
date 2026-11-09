@@ -1,0 +1,16 @@
+[package]
+name = "zeros"
+version = "0.1.0"
+edition = "2021"
+authors = ["SryImNoob"]
+description = "ZerOS — A bare-metal OS for Raspberry Pi Zero 2 W with Argon POD"
+license = "MIT"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "s"         # Optimize for size
+codegen-units = 1
