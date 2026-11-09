@@ -17,10 +17,15 @@ static TICKS: AtomicU64 = AtomicU64::new(0);
 static mut INTERVAL: u64 = 0;
 
 /// Read the timer counter frequency (Hz)
-fn frequency() -> u64 {
+pub fn frequency() -> u64 {
     let freq: u64;
     unsafe { core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq); }
     freq
+}
+
+/// Detect if running inside QEMU (QEMU raspi3b reports 62.5MHz; real RPi Zero 2 W is 19.2MHz)
+pub fn is_qemu() -> bool {
+    frequency() == 62_500_000
 }
 
 /// Read the current counter value

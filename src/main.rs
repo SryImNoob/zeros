@@ -66,21 +66,18 @@ pub extern "C" fn kernel_main() -> ! {
     mmu::init();
 
     // ── Stage 4: Display + Console ──
-    // Strategy: try GPU framebuffer first (works in QEMU and HDMI),
-    // then fall back to SPI ILI9341 (Argon POD real hardware).
-    if framebuffer::init(320, 240) {
-        // GPU framebuffer available (QEMU or HDMI)
-        console::init();
-        println!("[OK] Console: 40x30 text, dual output (UART + screen)");
-    } else {
-        // No GPU framebuffer — try SPI display (real Argon POD hardware)
-        println!("[..] GPU framebuffer not available, trying SPI display...");
+    // Initialize GPU framebuffer (works in QEMU and HDMI).
+    // On real hardware (!timer::is_qemu()), ALSO initialize the Argon POD
+    // SPI0 + ILI9341 2.8" LCD so output is mirrored to the physical POD screen!
+    let fb_ok = framebuffer::init(320, 240);
+    let mut spi_ok = false;
+    if !timer::is_qemu() {
         spi::init();
-        if ili9341::init() {
-            println!("[OK] ILI9341 SPI display initialized");
-        } else {
-            println!("[WARN] No display available — UART only mode");
-        }
+        spi_ok = ili9341::init();
+    }
+    if fb_ok || spi_ok {
+        console::init();
+        println!("[OK] Console: 40x30 text + status bar (FB={}, SPI_LCD={})", fb_ok, spi_ok);
     }
 
     // ── Stage 5: Input (buttons + IR) ──
@@ -159,6 +156,11 @@ fn input_monitor_task() {
             match event {
                 input::InputEvent::ButtonPress(btn) => {
                     println!("[BTN] Button {} pressed", btn + 1);
+                    if btn == 3 {
+                        // Button 4 (GPIO 26): Reboot back to default OS (Raspberry Pi OS / Slot A)
+                        println!("[SYS] Button 4 pressed -> rebooting to default partition...");
+                        tryboot::reboot_to_partition(0);
+                    }
                 }
                 input::InputEvent::ButtonRelease(btn) => {
                     println!("[BTN] Button {} released", btn + 1);

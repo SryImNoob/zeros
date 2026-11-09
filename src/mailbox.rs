@@ -33,16 +33,29 @@ pub const TAG_END: u32 = 0;
 // Response codes
 const RESPONSE_OK: u32 = 0x8000_0000;
 
+/// Clean and invalidate data cache lines covering `buffer` (64-byte cache lines on Cortex-A53)
+unsafe fn flush_cache_range(start_addr: usize, byte_len: usize) {
+    let start = start_addr & !63;
+    let end = (start_addr + byte_len + 63) & !63;
+    let mut addr = start;
+    while addr < end {
+        core::arch::asm!("dc civac, {}", in(reg) addr);
+        addr += 64;
+    }
+    core::arch::asm!("dsb sy");
+}
+
 /// Send a property tag request via the mailbox.
 /// `buffer` must be a 16-byte aligned mutable slice of u32.
 /// Returns true on success.
 pub fn call(buffer: &mut [u32]) -> bool {
     let addr = buffer.as_ptr() as u32;
     assert!(addr & 0xF == 0, "Mailbox buffer must be 16-byte aligned");
+    let byte_len = buffer.len() * 4;
 
     unsafe {
-        // Ensure all writes to the buffer are visible
-        core::arch::asm!("dsb sy");
+        // Flush CPU L1/L2 cache lines so VideoCore GPU reads fresh data from RAM
+        flush_cache_range(addr as usize, byte_len);
 
         // Wait for mailbox not full
         while mmio::read(MBOX_STATUS) & MBOX_FULL != 0 {
@@ -60,8 +73,8 @@ pub fn call(buffer: &mut [u32]) -> bool {
 
             let resp = mmio::read(MBOX_READ);
             if resp & 0xF == CHANNEL_PROP {
-                // Invalidate cache for the buffer
-                core::arch::asm!("dsb sy");
+                // Invalidate cache lines so CPU reads GPU's response from RAM
+                flush_cache_range(addr as usize, byte_len);
                 return buffer[1] == RESPONSE_OK;
             }
         }

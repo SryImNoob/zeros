@@ -90,7 +90,13 @@ pub fn transfer_byte(cs: u8, tx: u8) -> u8 {
         mmio::write(SPI_CS, cs_val | CS_TA);
 
         // Wait for TX FIFO ready
+        let mut timeout = 100_000u32;
         while mmio::read(SPI_CS) & CS_TXD == 0 {
+            timeout -= 1;
+            if timeout == 0 {
+                mmio::write(SPI_CS, 0);
+                return 0;
+            }
             core::hint::spin_loop();
         }
 
@@ -98,7 +104,12 @@ pub fn transfer_byte(cs: u8, tx: u8) -> u8 {
         mmio::write(SPI_FIFO, tx as u32);
 
         // Wait for transfer complete
+        timeout = 100_000;
         while mmio::read(SPI_CS) & CS_DONE == 0 {
+            timeout -= 1;
+            if timeout == 0 {
+                break;
+            }
             core::hint::spin_loop();
         }
 
@@ -126,20 +137,33 @@ pub fn write_bytes(cs: u8, data: &[u8]) {
 
         for &byte in data {
             // Wait for TX FIFO space
+            let mut timeout = 100_000u32;
             while mmio::read(SPI_CS) & CS_TXD == 0 {
+                timeout -= 1;
+                if timeout == 0 {
+                    mmio::write(SPI_CS, 0);
+                    return;
+                }
                 core::hint::spin_loop();
             }
             mmio::write(SPI_FIFO, byte as u32);
         }
 
         // Wait for transfer complete
+        let mut timeout = 100_000u32;
         while mmio::read(SPI_CS) & CS_DONE == 0 {
+            timeout -= 1;
+            if timeout == 0 {
+                break;
+            }
             core::hint::spin_loop();
         }
 
         // Drain RX FIFO
-        while mmio::read(SPI_CS) & CS_RXD != 0 {
+        timeout = 10_000;
+        while mmio::read(SPI_CS) & CS_RXD != 0 && timeout > 0 {
             let _ = mmio::read(SPI_FIFO);
+            timeout -= 1;
         }
 
         // Deassert CS

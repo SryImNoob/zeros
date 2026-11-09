@@ -16,9 +16,10 @@ use crate::mmio;
 use crate::spi;
 
 // ─── GPIO pins for the Argon POD ILI9341 ───
-const PIN_DC:  u32 = 25;  // Data/Command select: LOW=command, HIGH=data
-const PIN_RST: u32 = 27;  // Hardware reset (active low)
-const PIN_BL:  u32 = 18;  // Backlight control
+const PIN_DC:      u32 = 25;  // Data/Command select: LOW=command, HIGH=data
+const PIN_RST:     u32 = 27;  // Hardware reset (active low)
+const PIN_RST_ALT: u32 = 24;  // Alternate reset pin on some tft9341 revisions
+const PIN_BL:      u32 = 18;  // Backlight control
 
 /// Display SPI chip select (CE0)
 const SPI_CS_DISPLAY: u8 = 0;
@@ -72,14 +73,18 @@ pub fn init() -> bool {
     // ── Configure GPIO pins as outputs ──
     gpio_output(PIN_DC);
     gpio_output(PIN_RST);
+    gpio_output(PIN_RST_ALT);
     gpio_output(PIN_BL);
 
     // ── Hardware reset sequence ──
     gpio_set(PIN_RST, true);
+    gpio_set(PIN_RST_ALT, true);
     delay_ms(5);
     gpio_set(PIN_RST, false);
+    gpio_set(PIN_RST_ALT, false);
     delay_ms(20);
     gpio_set(PIN_RST, true);
+    gpio_set(PIN_RST_ALT, true);
     delay_ms(150);
 
     // ── Turn on backlight ──
@@ -231,6 +236,41 @@ impl Ili9341 {
         }
 
         write_data(&buf);
+    }
+
+    /// Draw a string at pixel position (x, y)
+    pub fn draw_str(&self, x: u32, y: u32, s: &str, fg: u16, bg: u16) {
+        let mut cx = x;
+        for byte in s.bytes() {
+            if cx + 8 > self.width {
+                break;
+            }
+            self.draw_char(cx, y, byte, fg, bg);
+            cx += 8;
+        }
+    }
+
+    /// Copy the contents of the RAM framebuffer (rows `start_y..self.height`) to the ILI9341
+    pub fn flush_from_fb(&self, fb: &crate::framebuffer::Framebuffer, start_y: u32) {
+        let y0 = start_y.min(self.height - 1);
+        self.set_window(0, y0 as u16, (self.width - 1) as u16, (self.height - 1) as u16);
+        write_cmd(CMD_MEM_WRITE);
+
+        let pitch_pixels = fb.pitch / 2;
+        let mut row_buf = [0u8; (WIDTH as usize) * 2];
+
+        unsafe {
+            for row in y0..self.height {
+                for col in 0..self.width {
+                    let offset = (row * pitch_pixels + col) as isize;
+                    let pixel = *fb.buffer.offset(offset);
+                    let idx = (col * 2) as usize;
+                    row_buf[idx] = (pixel >> 8) as u8;
+                    row_buf[idx + 1] = (pixel & 0xFF) as u8;
+                }
+                write_data(&row_buf);
+            }
+        }
     }
 }
 
