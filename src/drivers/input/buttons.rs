@@ -14,17 +14,12 @@
 
 #![allow(dead_code)]
 
-use crate::mmio;
+use crate::bsp::argon_pod::{BUTTON_PINS, PIN_BTN_1, PIN_BTN_2, PIN_BTN_3, PIN_BTN_4, PIN_IR_RECV};
+use crate::drivers::mmio;
+use crate::sync::IrqSafeLock;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-// ─── GPIO pin assignments ───
-const BTN_1: u32 = 16;
-const BTN_2: u32 = 20;
-const BTN_3: u32 = 21;
-const BTN_4: u32 = 26;
-const IR_PIN: u32 = 23;
-
-const BUTTONS: [u32; 4] = [BTN_1, BTN_2, BTN_3, BTN_4];
+const BUTTONS: [u32; 4] = BUTTON_PINS;
 
 // ─── GPIO registers ───
 const GPIO_BASE: usize = mmio::PERIPHERAL_BASE + 0x0020_0000;
@@ -50,47 +45,54 @@ pub enum InputEvent {
     ButtonPress(u8),    // Button index 0-3
     ButtonRelease(u8),  // Button index 0-3
     IrCode(u32),        // NEC IR code (addr + command)
+    Touch(u16, u16),    // Resistive touch screen coordinates (x, y) in 320x240
 }
 
-/// Simple ring buffer for events
+/// Simple ring buffer for events protected by `IrqSafeLock` (no `static mut`)
 const EVENT_QUEUE_SIZE: usize = 16;
-static mut EVENT_QUEUE: [Option<InputEvent>; EVENT_QUEUE_SIZE] = [None; EVENT_QUEUE_SIZE];
-static mut EVENT_HEAD: usize = 0;
-static mut EVENT_TAIL: usize = 0;
+
+struct EventQueue {
+    buf: [Option<InputEvent>; EVENT_QUEUE_SIZE],
+    head: usize,
+    tail: usize,
+}
+
+static EVENT_QUEUE: IrqSafeLock<EventQueue> = IrqSafeLock::new(EventQueue {
+    buf: [None; EVENT_QUEUE_SIZE],
+    head: 0,
+    tail: 0,
+});
 
 /// Push an event into the queue
 pub fn push_event(event: InputEvent) {
-    crate::interrupts::without_interrupts(|| unsafe {
-        let next_head = (EVENT_HEAD + 1) % EVENT_QUEUE_SIZE;
-        if next_head != EVENT_TAIL {
-            EVENT_QUEUE[EVENT_HEAD] = Some(event);
-            EVENT_HEAD = next_head;
+    EVENT_QUEUE.with(|q| {
+        let next_head = (q.head + 1) % EVENT_QUEUE_SIZE;
+        if next_head != q.tail {
+            q.buf[q.head] = Some(event);
+            q.head = next_head;
         }
-        // If queue is full, drop the event silently
     });
 }
 
 /// Pop an event from the queue
 pub fn poll_event() -> Option<InputEvent> {
-    crate::interrupts::without_interrupts(|| unsafe {
-        if EVENT_TAIL == EVENT_HEAD {
+    EVENT_QUEUE.with(|q| {
+        if q.tail == q.head {
             return None;
         }
-        let event = EVENT_QUEUE[EVENT_TAIL].take();
-        EVENT_TAIL = (EVENT_TAIL + 1) % EVENT_QUEUE_SIZE;
+        let event = q.buf[q.tail].take();
+        q.tail = (q.tail + 1) % EVENT_QUEUE_SIZE;
         event
     })
 }
 
 /// Check if the event queue has pending events
 pub fn has_events() -> bool {
-    crate::interrupts::without_interrupts(|| unsafe {
-        EVENT_TAIL != EVENT_HEAD
-    })
+    EVENT_QUEUE.with(|q| q.tail != q.head)
 }
 
 /// Initialize the input system.
-/// Configures button GPIO pins as inputs with pull-ups.
+/// Configures button GPIO pins as inputs with pull-ups, IR input, and Touch PENIRQ.
 pub fn init() {
     // Configure each button pin as input with pull-up
     for &pin in &BUTTONS {
@@ -98,10 +100,13 @@ pub fn init() {
     }
 
     // Configure IR pin as input (no pull needed, has external pull-up on module)
-    gpio_input(IR_PIN);
+    gpio_input(PIN_IR_RECV);
 
-    crate::println!("[OK] Input: 4 buttons (GPIO {},{},{},{}), IR (GPIO {})",
-        BTN_1, BTN_2, BTN_3, BTN_4, IR_PIN);
+    // Configure Touch PENIRQ pin (GPIO 17)
+    super::touch::init();
+
+    crate::println!("[OK] Input: 4 buttons (GPIO {},{},{},{}), IR (GPIO {}), Touch (GPIO 17)",
+        PIN_BTN_1, PIN_BTN_2, PIN_BTN_3, PIN_BTN_4, PIN_IR_RECV);
 }
 
 /// Poll buttons for state changes (call from timer tick or main loop).

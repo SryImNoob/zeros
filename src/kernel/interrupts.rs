@@ -7,8 +7,9 @@
 // The ARM Generic Timer IRQ is routed through the Local Peripheral controller,
 // NOT through the legacy GPU controller.
 
-use crate::mmio;
-use crate::timer;
+use crate::arch::exception::ExceptionContext;
+use crate::arch::timer;
+use crate::drivers::mmio;
 
 /// ARM Local Peripherals base address (QA7)
 const LOCAL_BASE: usize = 0x4000_0000;
@@ -40,7 +41,7 @@ pub fn disable_timer_irq() {
 
 /// Top-level IRQ dispatcher — called from the exception vector table
 #[no_mangle]
-pub extern "C" fn irq_dispatch(_ctx: &crate::exception::ExceptionContext) {
+pub extern "C" fn irq_dispatch(_ctx: &ExceptionContext) {
     let source = unsafe { mmio::read(CORE0_IRQ_SOURCE) };
 
     if source & IRQ_SRC_CNTPNSIRQ != 0 {

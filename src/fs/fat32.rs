@@ -11,7 +11,7 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::sd::{self, SECTOR_SIZE};
+use crate::drivers::block::sd::{self, SECTOR_SIZE};
 
 /// MBR Partition entry
 #[derive(Debug, Clone, Copy)]

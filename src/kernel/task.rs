@@ -10,9 +10,9 @@
 // when all other tasks are sleeping.
 
 use core::arch::global_asm;
-use crate::interrupts;
-use crate::page_alloc::{self, PAGE_SIZE};
-use crate::timer;
+use crate::arch::timer;
+use crate::kernel::interrupts;
+use crate::mm::page_alloc::{self, PAGE_SIZE};
 
 /// Maximum number of concurrent kernel tasks
 pub const MAX_TASKS: usize = 16;
@@ -394,6 +394,18 @@ pub fn print_tasks() {
                 " #{:<2} {:<12}  {:<10}  {:>5}  0x{:08x} ({}KB)",
                 t.id, t.name, state_str, t.switches, t.stack_base, t.stack_size / 1024
             );
+        }
+    });
+}
+
+/// Iterate over all non-unused tasks safely with interrupts masked (used by GUI System Monitor).
+pub fn with_tasks<F: FnMut(&Task)>(mut f: F) {
+    interrupts::without_interrupts(|| unsafe {
+        for i in 0..MAX_TASKS {
+            let t = &TASKS[i];
+            if t.state != TaskState::Unused {
+                f(t);
+            }
         }
     });
 }

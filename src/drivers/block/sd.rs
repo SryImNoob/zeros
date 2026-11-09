@@ -8,7 +8,7 @@
 
 #![allow(dead_code)]
 
-use crate::mmio;
+use crate::drivers::mmio;
 
 // ─── EMMC Register Offsets (Base: 0x3F30_0000) ───
 const EMMC_BASE:       usize = mmio::PERIPHERAL_BASE + 0x0030_0000;
@@ -132,7 +132,7 @@ unsafe fn route_emmc_to_sdcard() {
 /// Returns `true` if a card was detected and initialized.
 pub fn init() -> bool {
     unsafe {
-        if !crate::timer::is_qemu() {
+        if !crate::bsp::is_qemu() {
             route_emmc_to_sdcard();
         }
 

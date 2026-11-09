@@ -1,0 +1,637 @@
+// ZerOS — Interactive GUI Launcher & System Apps (M7.1)
+//
+// Provides a 4-tab graphical interface tailored for the Argon POD's
+// 320×240 RGB565 TFT display, 4 hardware buttons, NEC IR receiver, and
+// resistive touch screen:
+//
+//   Tab 0 [1:SYS]   — Live System Monitor (SoC Temp, ARM Clock, RAM bar, Task table)
+//   Tab 1 [2:FILES] — SD Card FAT32 File Browser & Text File Viewer
+//   Tab 2 [3:INPUT] — Hardware Button, NEC IR & Touch Screen Visualizer
+//   Tab 3 [4:LOG]   — Live Kernel Log Viewer
+//
+// Controls (4 Argon POD Bezel Buttons):
+//   - Button 1 (GPIO 16): Switch Tab (or Move Cursor Up in File Viewer)
+//   - Button 2 (GPIO 20): Move Cursor Down (in FILES) / Prev Tab
+//   - Button 3 (GPIO 21): Action / Open File Preview / Refresh
+//   - Button 4 (GPIO 26): Reboot back to Raspberry Pi OS immediately
+
+#![allow(dead_code)]
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt::Write;
+
+use crate::arch::timer;
+use crate::drivers::display::{self, colors, Color};
+use crate::drivers::input::{self, touch, InputEvent};
+use crate::drivers::mailbox;
+use crate::fs::fat32::{self, DirEntry};
+use crate::kernel::{console, task, tryboot};
+use crate::mm::page_alloc;
+
+// ─── Color Palette (Retro Dark Card UI) ───
+const COL_BG: Color = colors::rgb(12, 16, 24);
+const COL_CARD_BG: Color = colors::rgb(22, 30, 46);
+const COL_CARD_BORDER: Color = colors::rgb(56, 78, 112);
+const COL_TAB_INACTIVE: Color = colors::rgb(28, 38, 56);
+const COL_TAB_ACTIVE: Color = colors::rgb(0, 120, 215);
+const COL_ACCENT: Color = colors::rgb(0, 210, 255);
+const COL_TEXT_DIM: Color = colors::rgb(150, 165, 190);
+const COL_FOOTER_BG: Color = colors::rgb(18, 24, 36);
+const COL_SEL_BG: Color = colors::rgb(0, 90, 160);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    SysMon = 0,
+    Files = 1,
+    InputTest = 2,
+    KernelLog = 3,
+}
+
+impl Tab {
+    fn next(self) -> Self {
+        match self {
+            Tab::SysMon => Tab::Files,
+            Tab::Files => Tab::InputTest,
+            Tab::InputTest => Tab::KernelLog,
+            Tab::KernelLog => Tab::SysMon,
+        }
+    }
+
+    fn prev(self) -> Self {
+        match self {
+            Tab::SysMon => Tab::KernelLog,
+            Tab::Files => Tab::SysMon,
+            Tab::InputTest => Tab::Files,
+            Tab::KernelLog => Tab::InputTest,
+        }
+    }
+}
+
+pub struct UiState {
+    tab: Tab,
+    needs_full_redraw: bool,
+    needs_content_update: bool,
+    // Files tab state
+    files: Vec<DirEntry>,
+    file_cursor: usize,
+    viewing_file: bool,
+    file_preview_name: String,
+    file_preview_lines: Vec<String>,
+    // Input tab state
+    last_btn_pressed: Option<u8>,
+    last_ir_code: Option<u32>,
+    last_touch: Option<(u16, u16)>,
+    event_count: u32,
+}
+
+impl UiState {
+    pub fn new() -> Self {
+        let files = if fat32::is_mounted() {
+            fat32::list_root()
+        } else {
+            Vec::new()
+        };
+
+        Self {
+            tab: Tab::SysMon,
+            needs_full_redraw: true,
+            needs_content_update: true,
+            files,
+            file_cursor: 0,
+            viewing_file: false,
+            file_preview_name: String::new(),
+            file_preview_lines: Vec::new(),
+            last_btn_pressed: None,
+            last_ir_code: None,
+            last_touch: None,
+            event_count: 0,
+        }
+    }
+
+    /// Handle an input event (button press/release, IR code, or touch).
+    pub fn handle_event(&mut self, ev: InputEvent) {
+        self.event_count += 1;
+        match ev {
+            InputEvent::ButtonPress(btn) => {
+                self.last_btn_pressed = Some(btn);
+                match btn {
+                    0 => {
+                        // Button 1 (GPIO 16): Next Tab (or close file preview)
+                        if self.viewing_file {
+                            self.viewing_file = false;
+                        } else {
+                            self.tab = self.tab.next();
+                        }
+                        self.needs_full_redraw = true;
+                    }
+                    1 => {
+                        // Button 2 (GPIO 20): In FILES tab -> move cursor down; otherwise next tab
+                        if self.tab == Tab::Files && !self.viewing_file && !self.files.is_empty() {
+                            self.file_cursor = (self.file_cursor + 1) % self.files.len();
+                            self.needs_content_update = true;
+                        } else if self.viewing_file {
+                            self.viewing_file = false;
+                            self.needs_full_redraw = true;
+                        } else {
+                            self.tab = self.tab.prev();
+                            self.needs_full_redraw = true;
+                        }
+                    }
+                    2 => {
+                        // Button 3 (GPIO 21): Action / Open file preview in FILES
+                        if self.tab == Tab::Files {
+                            if self.viewing_file {
+                                self.viewing_file = false;
+                            } else {
+                                self.open_selected_file();
+                            }
+                            self.needs_full_redraw = true;
+                        } else {
+                            self.needs_content_update = true;
+                        }
+                    }
+                    3 => {
+                        // Button 4 (GPIO 26): Reboot back to Raspberry Pi OS (Slot A)
+                        crate::println!("[UI] Button 4 pressed -> Rebooting to RPi OS...");
+                        display::fill_rect(20, 90, 280, 60, colors::BLUE);
+                        display::draw_rect_border(20, 90, 280, 60, 2, colors::WHITE);
+                        display::draw_str(
+                            44,
+                            116,
+                            "Rebooting to Raspberry Pi OS...",
+                            colors::WHITE,
+                            colors::BLUE,
+                        );
+                        tryboot::reboot_to_partition(0);
+                    }
+                    _ => {}
+                }
+            }
+            InputEvent::ButtonRelease(_) => {
+                if self.tab == Tab::InputTest {
+                    self.needs_content_update = true;
+                }
+            }
+            InputEvent::IrCode(code) => {
+                self.last_ir_code = Some(code);
+                if self.tab == Tab::InputTest {
+                    self.needs_content_update = true;
+                }
+            }
+            InputEvent::Touch(x, y) => {
+                self.last_touch = Some((x, y));
+                // Tapping the tab bar (y = 8..28) switches tabs directly!
+                if (8..28).contains(&y) {
+                    let new_tab = match x / 80 {
+                        0 => Tab::SysMon,
+                        1 => Tab::Files,
+                        2 => Tab::InputTest,
+                        _ => Tab::KernelLog,
+                    };
+                    if new_tab != self.tab {
+                        self.viewing_file = false;
+                        self.tab = new_tab;
+                        self.needs_full_redraw = true;
+                        return;
+                    }
+                }
+                if self.tab == Tab::InputTest {
+                    self.needs_content_update = true;
+                }
+            }
+        }
+    }
+
+    fn open_selected_file(&mut self) {
+        if self.files.is_empty() {
+            return;
+        }
+        let entry = &self.files[self.file_cursor];
+        self.file_preview_name = entry.name.clone();
+        self.file_preview_lines.clear();
+
+        if entry.size > 64 * 1024 {
+            let mut msg = String::new();
+            let _ = write!(msg, "(Binary/Large file: {} bytes)", entry.size);
+            self.file_preview_lines.push(msg);
+            self.viewing_file = true;
+            return;
+        }
+
+        if let Some(bytes) = fat32::read_file(&entry.name) {
+            for line_bytes in bytes.split(|&b| b == b'\n').take(12) {
+                let mut s = String::new();
+                for &b in line_bytes.iter().take(36) {
+                    if b == b'\r' {
+                        continue;
+                    }
+                    let ch = if (0x20..=0x7E).contains(&b) {
+                        b as char
+                    } else {
+                        '.'
+                    };
+                    s.push(ch);
+                }
+                self.file_preview_lines.push(s);
+            }
+        } else {
+            self.file_preview_lines.push(String::from("(Failed to read cluster chain)"));
+        }
+        self.viewing_file = true;
+    }
+
+    /// Periodic 1Hz tick — refreshes live data on the active tab without full-screen flicker.
+    pub fn on_periodic_tick(&mut self) {
+        if self.tab == Tab::SysMon || self.tab == Tab::KernelLog {
+            self.needs_content_update = true;
+        }
+    }
+
+    /// Render any pending UI updates.
+    pub fn render(&mut self) {
+        if self.needs_full_redraw {
+            self.draw_chrome();
+            self.needs_full_redraw = false;
+            self.needs_content_update = true;
+        }
+
+        if self.needs_content_update {
+            self.needs_content_update = false;
+            match self.tab {
+                Tab::SysMon => self.draw_sysmon_content(),
+                Tab::Files => self.draw_files_content(),
+                Tab::InputTest => self.draw_input_content(),
+                Tab::KernelLog => self.draw_log_content(),
+            }
+        }
+    }
+
+    /// Draw the tab bar (`y = 8..28`), main card frame (`y = 32..220`), and footer (`y = 224..240`).
+    fn draw_chrome(&self) {
+        // Clear workspace between top status bar (y=0..8) and bottom (y=240)
+        display::fill_rect(0, 8, 320, 232, COL_BG);
+
+        // 4 Tabs across y = 8..28
+        let tabs = [
+            (Tab::SysMon, " 1:SYS    "),
+            (Tab::Files, " 2:FILES  "),
+            (Tab::InputTest, " 3:INPUT  "),
+            (Tab::KernelLog, " 4:LOGS   "),
+        ];
+        for (i, (t, label)) in tabs.iter().enumerate() {
+            let x = (i as u32) * 80;
+            let active = self.tab == *t;
+            let bg = if active { COL_TAB_ACTIVE } else { COL_TAB_INACTIVE };
+            let fg = if active { colors::WHITE } else { COL_TEXT_DIM };
+            display::fill_rect(x, 8, 79, 20, bg);
+            display::draw_str(x, 14, label, fg, bg);
+            if active {
+                display::fill_rect(x, 26, 79, 2, COL_ACCENT);
+            }
+        }
+
+        // Main Card Frame (x=6..314, y=32..220)
+        display::fill_rect(6, 32, 308, 188, COL_CARD_BG);
+        display::draw_rect_border(6, 32, 308, 188, 1, COL_CARD_BORDER);
+
+        // Footer bar (y = 224..240)
+        display::fill_rect(0, 224, 320, 16, COL_FOOTER_BG);
+        let footer = match self.tab {
+            Tab::Files if !self.viewing_file => " B1:Tab  B2:Down  B3:Open  B4:RPiOS   ",
+            Tab::Files => " B1/B2/B3:Close Preview    B4:RPiOS   ",
+            _ => " B1:NextTab B2:Prev B3:Ref B4:RPiOS   ",
+        };
+        display::draw_str(4, 228, footer, COL_ACCENT, COL_FOOTER_BG);
+    }
+
+    fn draw_sysmon_content(&self) {
+        display:: draw_str(
+            14,
+            40,
+            "HARDWARE & KERNEL TELEMETRY",
+            COL_ACCENT,
+            COL_CARD_BG,
+        );
+        display::fill_rect(14, 50, 292, 1, COL_CARD_BORDER);
+
+        // 1. SoC Temperature + ARM Clock
+        let temp_mc = mailbox::get_soc_temp_mc().unwrap_or(42_500);
+        let temp_c = temp_mc / 1000;
+        let temp_frac = (temp_mc % 1000) / 100;
+        let arm_mhz = mailbox::get_arm_clock_hz().unwrap_or(1_000_000_000) / 1_000_000;
+
+        let mut line = String::with_capacity(40);
+        let _ = write!(
+            line,
+            "SoC Temp : {}.{} C   ARM: {:>4} MHz  ",
+            temp_c, temp_frac, arm_mhz
+        );
+        display::draw_str(14, 58, &line, colors::WHITE, COL_CARD_BG);
+
+        let temp_pct = temp_c.saturating_sub(25).min(60) * 100 / 60;
+        let temp_col = if temp_c < 55 {
+            colors::GREEN
+        } else if temp_c < 70 {
+            colors::YELLOW
+        } else {
+            colors::RED
+        };
+        display::draw_progress_bar(14, 70, 292, 10, temp_pct, temp_col, COL_BG, COL_CARD_BORDER);
+
+        // 2. Physical Memory Usage
+        let free_pages = page_alloc::free_count();
+        let free_mb = (free_pages * page_alloc::PAGE_SIZE) / (1024 * 1024);
+        let total_mb = 256usize;
+        let used_mb = total_mb.saturating_sub(free_mb);
+        let mem_pct = ((used_mb * 100) / total_mb).max(4) as u32;
+
+        line.clear();
+        let _ = write!(
+            line,
+            "RAM Pool : {} MB free / {} MB ({}p)",
+            free_mb, total_mb, free_pages
+        );
+        display::draw_str(14, 88, &line, colors::WHITE, COL_CARD_BG);
+        display::draw_progress_bar(
+            14,
+            100,
+            292,
+            10,
+            mem_pct,
+            COL_ACCENT,
+            COL_BG,
+            COL_CARD_BORDER,
+        );
+
+        // 3. Multitasking Scheduler Table
+        display::draw_str(
+            14,
+            118,
+            "PID NAME       STATE    TICKS   SW  ",
+            COL_ACCENT,
+            COL_CARD_BG,
+        );
+        display::fill_rect(14, 128, 292, 1, COL_CARD_BORDER);
+
+        let mut row_y = 134u32;
+        task::with_tasks(|t| {
+            if row_y + 8 > 214 {
+                return;
+            }
+            let st = match t.state {
+                task::TaskState::Running => "RUN  ",
+                task::TaskState::Ready => "READY",
+                task::TaskState::Sleeping(_) => "SLEEP",
+                task::TaskState::Finished => "DONE ",
+                task::TaskState::Unused => "FREE ",
+            };
+            let mut tline = String::with_capacity(40);
+            let _ = write!(
+                tline,
+                " #{:<1} {:<10} {:<6} {:>7} {:>4}  ",
+                t.id, t.name, st, t.ticks_run, t.switches
+            );
+            display::draw_str(14, row_y, &tline, colors::WHITE, COL_CARD_BG);
+            row_y += 12;
+        });
+    }
+
+    fn draw_files_content(&self) {
+        if self.viewing_file {
+            let mut title = String::with_capacity(38);
+            let _ = write!(title, "FILE: {:<28}", self.file_preview_name);
+            display::draw_str(14, 40, &title, colors::YELLOW, COL_CARD_BG);
+            display::fill_rect(14, 50, 292, 1, COL_CARD_BORDER);
+
+            for i in 0..12 {
+                let y = 56 + (i as u32) * 13;
+                let text = self
+                    .file_preview_lines
+                    .get(i)
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                let mut padded = String::with_capacity(36);
+                let _ = write!(padded, "{:<36}", text);
+                display::draw_str(14, y, &padded, colors::WHITE, COL_CARD_BG);
+            }
+            return;
+        }
+
+        let mut hdr = String::with_capacity(38);
+        let _ = write!(
+            hdr,
+            "FAT32 /boot/firmware ({} files)",
+            self.files.len()
+        );
+        display::draw_str(14, 40, &hdr, COL_ACCENT, COL_CARD_BG);
+        display::fill_rect(14, 50, 292, 1, COL_CARD_BORDER);
+
+        if self.files.is_empty() {
+            display::draw_str(
+                14,
+                70,
+                "No FAT32 volume mounted.",
+                COL_TEXT_DIM,
+                COL_CARD_BG,
+            );
+            return;
+        }
+
+        let visible = 10usize;
+        let start = if self.file_cursor >= visible {
+            self.file_cursor + 1 - visible
+        } else {
+            0
+        };
+
+        for row in 0..visible {
+            let idx = start + row;
+            let y = 56 + (row as u32) * 15;
+            if idx < self.files.len() {
+                let entry = &self.files[idx];
+                let selected = idx == self.file_cursor;
+                let bg = if selected { COL_SEL_BG } else { COL_CARD_BG };
+                let fg = if selected {
+                    colors::YELLOW
+                } else {
+                    colors::WHITE
+                };
+                let prefix = if selected { ">" } else { " " };
+                let mut line = String::with_capacity(38);
+                let _ = write!(
+                    line,
+                    "{} {:<15} {:>9} B  c:{:<4}",
+                    prefix, entry.name, entry.size, entry.first_cluster
+                );
+                display::draw_str(12, y, &line, fg, bg);
+            } else {
+                display::draw_str(
+                    12,
+                    y,
+                    "                                    ",
+                    COL_TEXT_DIM,
+                    COL_CARD_BG,
+                );
+            }
+        }
+    }
+
+    fn draw_input_content(&self) {
+        display::draw_str(
+            14,
+            40,
+            "ARGON POD INPUT & SENSOR TESTER",
+            COL_ACCENT,
+            COL_CARD_BG,
+        );
+        display::fill_rect(14, 50, 292, 1, COL_CARD_BORDER);
+
+        // 4 Bezel Button Boxes
+        let btn_mask = input::button_state();
+        let pins = [16u32, 20, 21, 26];
+        for i in 0..4usize {
+            let x = 16 + (i as u32) * 73;
+            let y = 60;
+            let pressed = (btn_mask & (1 << i)) != 0;
+            let box_bg = if pressed { colors::GREEN } else { COL_BG };
+            let box_fg = if pressed { colors::BLACK } else { colors::WHITE };
+            display::fill_rect(x, y, 64, 38, box_bg);
+            display::draw_rect_border(x, y, 64, 38, 1, COL_CARD_BORDER);
+
+            let mut lbl = String::with_capacity(10);
+            let _ = write!(lbl, " BTN {} ", i + 1);
+            display::draw_str(x + 4, y + 8, &lbl, box_fg, box_bg);
+
+            lbl.clear();
+            let _ = write!(lbl, "GPIO {:>2}", pins[i]);
+            display::draw_str(x + 4, y + 22, &lbl, box_fg, box_bg);
+        }
+
+        // Last Button & Event count
+        let mut line = String::with_capacity(38);
+        match self.last_btn_pressed {
+            Some(b) => {
+                let _ = write!(
+                    line,
+                    "Last Button : BTN {} (Events: {:>4})  ",
+                    b + 1,
+                    self.event_count
+                );
+            }
+            None => {
+                let _ = write!(
+                    line,
+                    "Last Button : None  (Events: {:>4})  ",
+                    self.event_count
+                );
+            }
+        }
+        display::draw_str(14, 112, &line, colors::WHITE, COL_CARD_BG);
+
+        // NEC IR Receiver Status
+        line.clear();
+        match self.last_ir_code {
+            Some(code) => {
+                let addr = (code >> 8) & 0xFF;
+                let cmd = code & 0xFF;
+                let _ = write!(
+                    line,
+                    "IR (GPIO23) : 0x{:04X} (A:{:02X} C:{:02X})   ",
+                    code, addr, cmd
+                );
+            }
+            None => {
+                let _ = write!(line, "IR (GPIO23) : Waiting for remote... ");
+            }
+        }
+        display::draw_str(14, 134, &line, colors::CYAN, COL_CARD_BG);
+
+        // Resistive Touch Screen Status
+        line.clear();
+        match self.last_touch {
+            Some((tx, ty)) => {
+                let _ = write!(
+                    line,
+                    "Touch (CE1) : X={:>3}, Y={:>3} (Active) ",
+                    tx, ty
+                );
+            }
+            None => {
+                let _ = write!(line, "Touch (CE1) : Touch screen to test  ");
+            }
+        }
+        display::draw_str(14, 156, &line, colors::YELLOW, COL_CARD_BG);
+
+        // Timer Counter status
+        line.clear();
+        let _ = write!(
+            line,
+            "Timer Ticks : {:>8} (100Hz IRQ)  ",
+            timer::ticks()
+        );
+        display::draw_str(14, 182, &line, COL_TEXT_DIM, COL_CARD_BG);
+    }
+
+    fn draw_log_content(&self) {
+        display::draw_str(
+            14,
+            40,
+            "KERNEL CONSOLE RING BUFFER",
+            COL_ACCENT,
+            COL_CARD_BG,
+        );
+        display::fill_rect(14, 50, 292, 1, COL_CARD_BORDER);
+
+        console::with_recent_logs(15, |i, line_str| {
+            let y = 56 + (i as u32) * 10;
+            let mut padded = String::with_capacity(36);
+            let clipped = if line_str.len() > 36 {
+                &line_str[..36]
+            } else {
+                line_str
+            };
+            let _ = write!(padded, "{:<36}", clipped);
+            display::draw_str(14, y, &padded, colors::GREEN, COL_CARD_BG);
+        });
+    }
+}
+
+/// Interactive UI & Input Task — runs at 25Hz (every 40ms), polling buttons, IR, and Touch.
+pub fn ui_task() {
+    // Let the boot console display for 1.5 seconds so the user can see boot messages,
+    // then transition smoothly into the M7.1 Interactive Card Desktop!
+    task::sleep_ms(1500);
+
+    console::set_gui_mode(true);
+    let mut ui = UiState::new();
+    ui.render();
+
+    let mut tick_div = 0u32;
+    loop {
+        let mut had_event = false;
+        while let Some(ev) = input::poll_event() {
+            ui.handle_event(ev);
+            had_event = true;
+        }
+
+        // Poll resistive touch screen on SPI0 CE1 (every 40ms in task context)
+        if let Some((tx, ty)) = touch::poll_touch() {
+            ui.handle_event(InputEvent::Touch(tx, ty));
+            had_event = true;
+        }
+
+        tick_div += 1;
+        if tick_div >= 25 {
+            // 1Hz periodic telemetry refresh
+            tick_div = 0;
+            ui.on_periodic_tick();
+        }
+
+        if had_event || tick_div == 0 {
+            ui.render();
+        }
+
+        task::sleep_ms(40);
+    }
+}

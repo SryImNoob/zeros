@@ -7,7 +7,7 @@
 // On QEMU: shows a window with the framebuffer
 // On real hardware: outputs via HDMI (ILI9341 uses SPI separately)
 
-use crate::mailbox;
+use crate::drivers::mailbox;
 
 /// RGB565 color type
 pub type Color = u16;
@@ -162,7 +162,7 @@ impl Framebuffer {
 
     /// Draw a character at pixel position (x, y) using the 8×8 font
     pub fn draw_char(&self, x: u32, y: u32, c: u8, fg: Color, bg: Color) {
-        let glyph = crate::font::glyph(c);
+        let glyph = super::font::glyph(c);
         for row in 0..8u32 {
             let bits = glyph[row as usize];
             for col in 0..8u32 {

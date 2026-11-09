@@ -12,21 +12,21 @@
 
 #![allow(dead_code)]
 
-use crate::mmio;
-use crate::spi;
+use crate::bsp::argon_pod::{LCD_HEIGHT, LCD_WIDTH, PIN_LCD_BL, PIN_LCD_DC, PIN_LCD_RST};
+use crate::drivers::{mmio, spi};
 
 // ─── GPIO pins for the Argon POD ILI9341 ───
-const PIN_DC:      u32 = 22;  // Data/Command select: LOW=command, HIGH=data (0x16 in tft9341.dtbo)
-const PIN_RST:     u32 = 27;  // Hardware reset (active low, 0x1b in tft9341.dtbo)
-const PIN_RST_ALT: u32 = 25;  // Alternate reset pin on generic ILI9341 hats
-const PIN_BL:      u32 = 18;  // Backlight control (GPIO 18 in argonpodd.py)
+const PIN_DC:      u32 = PIN_LCD_DC;  // Data/Command select: LOW=command, HIGH=data (0x16 in tft9341.dtbo)
+const PIN_RST:     u32 = PIN_LCD_RST; // Hardware reset (active low, 0x1b in tft9341.dtbo)
+const PIN_RST_ALT: u32 = 25;          // Alternate reset pin on generic ILI9341 hats
+const PIN_BL:      u32 = PIN_LCD_BL;  // Backlight control (GPIO 18 in argonpodd.py)
 
 /// Display SPI chip select (CE0)
 const SPI_CS_DISPLAY: u8 = 0;
 
 /// Display dimensions
-pub const WIDTH:  u32 = 320;
-pub const HEIGHT: u32 = 240;
+pub const WIDTH:  u32 = LCD_WIDTH;
+pub const HEIGHT: u32 = LCD_HEIGHT;
 
 // ─── ILI9341 Commands ───
 const CMD_NOP:          u8 = 0x00;
@@ -203,7 +203,7 @@ impl Ili9341 {
             return;
         }
 
-        let glyph = crate::font::glyph(c);
+        let glyph = super::font::glyph(c);
 
         // Set window for the entire character to minimize SPI overhead
         self.set_window(x as u16, y as u16, (x + 7) as u16, (y + 7) as u16);
@@ -237,7 +237,7 @@ impl Ili9341 {
     }
 
     /// Copy the contents of the RAM framebuffer (rows `start_y..self.height`) to the ILI9341
-    pub fn flush_from_fb(&self, fb: &crate::framebuffer::Framebuffer, start_y: u32) {
+    pub fn flush_from_fb(&self, fb: &super::framebuffer::Framebuffer, start_y: u32) {
         let y0 = start_y.min(self.height - 1);
         self.set_window(0, y0 as u16, (self.width - 1) as u16, (self.height - 1) as u16);
         write_cmd(CMD_MEM_WRITE);

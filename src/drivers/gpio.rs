@@ -6,7 +6,8 @@
 // The activity LED is on the Pi Zero 2 W board itself,
 // NOT on the GPIO header, so it works even with Argon POD attached!
 
-use crate::mmio;
+use crate::drivers::mmio;
+use crate::sync::IrqSafeLock;
 
 /// GPIO register offsets from GPIO_BASE (0x3F200000)
 const GPFSEL2: usize = mmio::GPIO_BASE + 0x08;  // Function select for GPIO 20-29
@@ -16,8 +17,8 @@ const GPCLR0: usize = mmio::GPIO_BASE + 0x28;   // Pin output clear 0 (GPIO 0-31
 /// Activity LED pin
 const ACT_LED_PIN: u32 = 29;
 
-/// Track LED state (no atomic needed — only toggled from IRQ context)
-static mut LED_ON: bool = false;
+/// Track LED state protected by IrqSafeLock
+static LED_ON: IrqSafeLock<bool> = IrqSafeLock::new(false);
 
 /// Initialize GPIO (set activity LED pin as output)
 pub fn init() {
@@ -39,28 +40,30 @@ pub fn init() {
 /// Turn activity LED on (active-low: clear pin)
 #[allow(dead_code)]
 pub fn led_on() {
-    unsafe {
-        mmio::write(GPCLR0, 1 << ACT_LED_PIN);
-        LED_ON = true;
-    }
+    LED_ON.with(|on| {
+        unsafe { mmio::write(GPCLR0, 1 << ACT_LED_PIN); }
+        *on = true;
+    });
 }
 
 /// Turn activity LED off (active-low: set pin)
 #[allow(dead_code)]
 pub fn led_off() {
-    unsafe {
-        mmio::write(GPSET0, 1 << ACT_LED_PIN);
-        LED_ON = false;
-    }
+    LED_ON.with(|on| {
+        unsafe { mmio::write(GPSET0, 1 << ACT_LED_PIN); }
+        *on = false;
+    });
 }
 
 /// Toggle the activity LED
 pub fn toggle_activity_led() {
-    unsafe {
-        if LED_ON {
-            led_off();
+    LED_ON.with(|on| {
+        if *on {
+            unsafe { mmio::write(GPSET0, 1 << ACT_LED_PIN); }
+            *on = false;
         } else {
-            led_on();
+            unsafe { mmio::write(GPCLR0, 1 << ACT_LED_PIN); }
+            *on = true;
         }
-    }
+    });
 }

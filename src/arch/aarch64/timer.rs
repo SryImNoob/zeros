@@ -8,7 +8,8 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::interrupts;
+use crate::drivers::input;
+use crate::kernel::{interrupts, task};
 
 /// Global tick counter (incremented every timer IRQ)
 static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -76,21 +77,21 @@ pub fn handle_irq() {
     }
 
     // Poll buttons for debouncing (runs every tick for responsiveness)
-    crate::input::poll_buttons();
+    input::poll_buttons();
 
     // Poll IR decoder and push any decoded frame to the input queue
     unsafe {
-        let decoder = &mut *core::ptr::addr_of_mut!(crate::ir::IR_DECODER);
+        let decoder = &mut *core::ptr::addr_of_mut!(input::ir::IR_DECODER);
         if let Some(frame) = decoder.poll() {
             if !frame.is_repeat {
                 let code = ((frame.address as u32) << 8) | (frame.command as u32);
-                crate::input::push_event(crate::input::InputEvent::IrCode(code));
+                input::push_event(input::InputEvent::IrCode(code));
             }
         }
     }
 
     // Notify scheduler of timer tick (wakes sleeping tasks & accounts CPU ticks)
-    crate::task::on_tick(tick);
+    task::on_tick(tick);
 }
 
 /// Busy-wait delay in milliseconds (uses counter, no IRQ needed)

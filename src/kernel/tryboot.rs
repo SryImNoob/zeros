@@ -20,8 +20,8 @@
 
 #![allow(dead_code)]
 
-use crate::fat32;
-use crate::mmio;
+use crate::drivers::mmio;
+use crate::fs::fat32;
 
 // ─── BCM2710 Power Management / Watchdog Registers (Base: 0x3F10_0000) ───
 const PM_BASE: usize = mmio::PERIPHERAL_BASE + 0x0010_0000;

@@ -1,49 +1,46 @@
-// ZerOS — A bare-metal OS for Raspberry Pi Zero 2 W
+// ZerOS — A Bare-Metal Operating System for Raspberry Pi Zero 2 W + Argon POD
 //
-// Hardware: RPi Zero 2 W (BCM2710A1, Cortex-A53) + Argon POD (ILI9341 2.8" LCD)
-//
-// M1: Minimal boot + UART ✓
-// M2: Exception handling, interrupts, timer, GPIO ✓
-// M3: Physical page allocator, MMU, kernel heap ✓
-// M4: Framebuffer display + text console + SPI ILI9341 ✓
-// M5: Button & IR input handling ✓
-// M6: Task scheduler, SD/FAT32 filesystem, Tryboot A/B ✓
+// Architecture (M7.0 Modular Kernel Layout):
+//   - `arch/`    : AArch64 CPU boot, exception vectors, MMU page tables, generic timer
+//   - `bsp/`     : Board Support Package (BCM2710A1 memory map & Argon POD GPIO pinout)
+//   - `mm/`      : Physical page frame allocator & free-list kernel heap (`GlobalAlloc`)
+//   - `drivers/` : Hardware drivers (UART, GPIO, SPI0, Mailbox, ILI9341/FB, EMMC SD, Buttons/IR/Touch)
+//   - `kernel/`  : Core OS services (IRQ routing, multitasking scheduler, console, Tryboot A/B)
+//   - `fs/`      : MBR partition parser & FAT32 filesystem
+//   - `sync/`    : Interrupt-safe synchronization primitives (`IrqSafeLock`)
+//   - `ui/`      : Interactive 4-Tab Card Desktop / Launcher (M7.1)
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
-mod boot;
-mod console;
-mod exception;
-mod fat32;
-mod font;
-mod framebuffer;
-mod gpio;
-mod heap;
-mod ili9341;
-mod input;
-mod interrupts;
-mod ir;
-mod mailbox;
-mod mmio;
-mod mmu;
-mod page_alloc;
-mod sd;
-mod spi;
-mod task;
-mod timer;
-mod tryboot;
-mod uart;
+#[macro_use]
+pub mod drivers;
+
+pub mod arch;
+pub mod bsp;
+pub mod fs;
+pub mod kernel;
+pub mod mm;
+pub mod sync;
+pub mod ui;
 
 use core::panic::PanicInfo;
+
+use arch::{mmu, timer};
+use drivers::block::sd;
+use drivers::display::{framebuffer, ili9341};
+use drivers::{gpio, input, spi, uart};
+use fs::fat32;
+use kernel::{console, interrupts, task, tryboot};
+use mm::{heap, page_alloc};
 
 /// Kernel entry point
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
     // ── Stage 0: Arm hardware watchdog (15s auto-recovery on real hardware) ──
-    if !timer::is_qemu() {
+    if !bsp::is_qemu() {
         tryboot::watchdog_start(15);
     }
 
@@ -51,7 +48,7 @@ pub extern "C" fn kernel_main() -> ! {
     uart::init();
     println!();
     println!("=================================");
-    println!("  ZerOS v0.1.0");
+    println!("  ZerOS v0.2.0 (M7.1 GUI)");
     println!("  Raspberry Pi Zero 2 W");
     println!("  AArch64 bare-metal kernel");
     println!("=================================");
@@ -71,9 +68,7 @@ pub extern "C" fn kernel_main() -> ! {
     mmu::init();
 
     // ── Stage 4: Display + Console ──
-    // In QEMU: use VideoCore GPU framebuffer (320×240 window).
-    // On real Argon POD hardware: drive the 2.8" ILI9341 LCD directly over SPI0!
-    let display_ok = if timer::is_qemu() {
+    let display_ok = if bsp::is_qemu() {
         framebuffer::init(320, 240)
     } else {
         spi::init();
@@ -83,43 +78,40 @@ pub extern "C" fn kernel_main() -> ! {
     };
     if display_ok {
         console::init();
-        println!("== ZerOS v0.1.0 (AArch64 Bare-Metal) ==");
+        println!("== ZerOS v0.2.0 (AArch64 Bare-Metal) ==");
         println!("[OK] Console: 40x30 text + status bar");
     }
 
-    // ── Stage 5: Input (buttons + IR) ──
+    // ── Stage 5: Input (4 buttons + NEC IR + Resistive Touch) ──
     input::init();
 
     // ── Stage 6: SD Card + FAT32 Filesystem + Tryboot A/B ──
     if sd::init() {
-        if !timer::is_qemu() {
+        if !bsp::is_qemu() {
             tryboot::watchdog_feed(15);
         }
         if fat32::init() {
             let entries = fat32::list_root();
             println!("[OK] FAT32 root directory ({} files):", entries.len());
-            for entry in entries.iter().take(6) {
-                println!("     - {:<14} {:>7} bytes (cluster {})",
-                    entry.name, entry.size, entry.first_cluster);
+            for entry in entries.iter().take(5) {
+                println!(
+                    "     - {:<14} {:>7} bytes (cluster {})",
+                    entry.name, entry.size, entry.first_cluster
+                );
             }
             if let Some(ver_bytes) = fat32::read_file("VERSION.TXT") {
                 if let Ok(ver_str) = core::str::from_utf8(&ver_bytes) {
                     println!("[OK] Read VERSION.TXT: {}", ver_str.trim());
-                }
-            } else if let Some(tb_bytes) = fat32::read_file("TRYBOOT.TXT") {
-                if let Ok(tb_str) = core::str::from_utf8(&tb_bytes) {
-                    let first_line = tb_str.lines().next().unwrap_or("");
-                    println!("[OK] Read TRYBOOT.TXT ({}B, {})", tb_bytes.len(), first_line);
                 }
             }
         }
     }
     tryboot::init();
 
-    // ── Stage 7: Task Scheduler ──
+    // ── Stage 7: Task Scheduler & Interactive GUI (M7.1) ──
     task::init();
     task::spawn("heartbeat", heartbeat_task);
-    task::spawn("input_mon", input_monitor_task);
+    task::spawn("ui_desktop", ui::ui_task);
     task::spawn("self_test", self_test_task);
 
     // ── Stage 8: Timer (100Hz for responsive input & task wakeup) ──
@@ -128,27 +120,29 @@ pub extern "C" fn kernel_main() -> ! {
     // ── Stage 9: Enable interrupts ──
     interrupts::enable();
     println!("[OK] Interrupts enabled — timer ticking at 100Hz!");
-    println!();
-    println!("ZerOS is ready. Free pages: {} ({}MB), Active tasks: {}",
+    println!(
+        "ZerOS ready: {} free pages ({}MB), {} tasks",
         page_alloc::free_count(),
         page_alloc::free_count() * page_alloc::PAGE_SIZE / 1024 / 1024,
-        task::active_count());
-    println!();
+        task::active_count()
+    );
 
     // ── Idle task loop (Task 0) ──
     loop {
         task::yield_now();
-        unsafe { core::arch::asm!("wfe"); }
+        unsafe {
+            core::arch::asm!("wfe");
+        }
     }
 }
 
-/// Task #1: Periodic heartbeat (1Hz) — toggles LED, updates top status bar, prints status
+/// Task #1: Periodic heartbeat (1Hz) — feeds watchdog, toggles LED, updates top status bar
 fn heartbeat_task() {
     let mut seconds = 0u64;
     loop {
         task::sleep_ms(1000);
         seconds += 1;
-        if !timer::is_qemu() {
+        if !bsp::is_qemu() {
             tryboot::watchdog_feed(15);
         }
         gpio::toggle_activity_led();
@@ -160,42 +154,16 @@ fn heartbeat_task() {
         let active = task::active_count();
         console::update_status_bar(seconds, active, slot_str);
 
-        println!("[TICK] {}s uptime (slot: {}, tasks: {})", seconds, slot_str, active);
-        if seconds == 2 {
-            task::print_tasks();
-            if !timer::is_qemu() {
-                println!("[TIP] Press Button 4 (or wait 45s) to return to RPi OS");
-            }
-        }
-        if !timer::is_qemu() && seconds >= 45 {
-            println!("[SYS] 45s tryboot session complete -> rebooting to RPi OS...");
+        println!(
+            "[TICK] {}s uptime (slot: {}, tasks: {})",
+            seconds, slot_str, active
+        );
+
+        // Auto-return safety net after 120s on real hardware (or press Button 4 anytime)
+        if !bsp::is_qemu() && seconds >= 120 {
+            println!("[SYS] 120s tryboot session complete -> rebooting to RPi OS...");
             tryboot::reboot_to_partition(0);
         }
-    }
-}
-
-/// Task #2: Input event monitor — processes button presses and IR remote codes
-fn input_monitor_task() {
-    loop {
-        while let Some(event) = input::poll_event() {
-            match event {
-                input::InputEvent::ButtonPress(btn) => {
-                    println!("[BTN] Button {} pressed", btn + 1);
-                    if btn == 3 {
-                        // Button 4 (GPIO 26): Reboot back to default OS (Raspberry Pi OS / Slot A)
-                        println!("[SYS] Button 4 pressed -> rebooting to default partition...");
-                        tryboot::reboot_to_partition(0);
-                    }
-                }
-                input::InputEvent::ButtonRelease(btn) => {
-                    println!("[BTN] Button {} released", btn + 1);
-                }
-                input::InputEvent::IrCode(code) => {
-                    println!("[IR] Code: 0x{:04X}", code);
-                }
-            }
-        }
-        task::sleep_ms(20);
     }
 }
 
@@ -204,21 +172,24 @@ fn self_test_task() {
     println!("[TASK] self_test: starting background check...");
     task::sleep_ms(500);
 
-    // 1. Test dynamic allocation from a background task stack
     let mut vec = alloc::vec::Vec::new();
     for i in 1..=10u32 {
         vec.push(i * i);
     }
     let sum: u32 = vec.iter().sum();
-    println!("[TASK] self_test: heap check OK (sum of squares 1..10 = {})", sum);
+    println!(
+        "[TASK] self_test: heap check OK (sum of squares 1..10 = {})",
+        sum
+    );
 
-    // 2. Test FAT32 + Tryboot A/B configuration update round-trip
     if fat32::is_mounted() {
         let partitions = fat32::partitions();
         let part_count = partitions.iter().filter(|p| p.is_some()).count();
-        println!("[TASK] self_test: verified {} MBR partitions on SD card", part_count);
+        println!(
+            "[TASK] self_test: verified {} MBR partitions on SD card",
+            part_count
+        );
 
-        // Test committing Slot A as default (default=1, tryboot=2)
         if tryboot::set_default_partition(1, 2) {
             println!("[TASK] self_test: Tryboot A/B commit test OK");
         }
@@ -231,13 +202,23 @@ fn self_test_task() {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     interrupts::disable();
+    console::set_gui_mode(false);
     println!();
     println!("!!! KERNEL PANIC !!!");
     if let Some(location) = info.location() {
-        println!("  at {}:{}:{}", location.file(), location.line(), location.column());
+        println!(
+            "  at {}:{}:{}",
+            location.file(),
+            location.line(),
+            location.column()
+        );
     }
     if let Some(msg) = info.message().as_str() {
         println!("  {}", msg);
     }
-    loop { unsafe { core::arch::asm!("wfe"); } }
+    loop {
+        unsafe {
+            core::arch::asm!("wfe");
+        }
+    }
 }

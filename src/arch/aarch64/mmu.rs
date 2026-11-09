@@ -16,7 +16,7 @@
 // high RAM addresses (e.g. 0x3C100000), so we must map all RAM
 // up to 0x3F000000 — not just 512MB.
 
-use crate::page_alloc;
+use crate::mm::page_alloc;
 
 // ─── Page table entry flags ───
 

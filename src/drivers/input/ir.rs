@@ -15,12 +15,13 @@
 // This module provides a polling-based decoder. Call ir_poll() frequently
 // (e.g. from the timer tick at a high rate) to sample the IR pin.
 
-use crate::mmio;
+use crate::bsp::argon_pod::PIN_IR_RECV;
+use crate::drivers::mmio;
 
 // ─── GPIO ───
 const GPIO_BASE: usize = mmio::PERIPHERAL_BASE + 0x0020_0000;
 const GPIO_GPLEV0: usize = GPIO_BASE + 0x34;
-const IR_PIN: u32 = 23;
+const IR_PIN: u32 = PIN_IR_RECV;
 
 // ─── NEC timing (in microseconds) ───
 const LEADER_MARK_US:  u64 = 9000;

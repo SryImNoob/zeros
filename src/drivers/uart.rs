@@ -4,7 +4,7 @@
 // In QEMU: output appears on `-serial stdio`
 // On real hardware: accessible via mini-HDMI or USB serial (if configured)
 
-use crate::mmio;
+use crate::drivers::mmio;
 use core::fmt;
 
 const UART_DR: usize = mmio::UART0_BASE;           // Data register
@@ -80,16 +80,12 @@ impl fmt::Write for Writer {
 /// Writes to UART and (if initialized) the screen console.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    crate::interrupts::without_interrupts(|| {
+    crate::kernel::interrupts::without_interrupts(|| {
         use fmt::Write;
         // Always write to UART
         Writer.write_fmt(args).unwrap();
-        // Also write to screen console if available
-        unsafe {
-            if let Some(ref mut console) = crate::console::CONSOLE {
-                console.write_fmt(args).ok();
-            }
-        }
+        // Also write to screen console / log history
+        crate::kernel::console::write_fmt(args);
     });
 }
 
@@ -97,7 +93,7 @@ pub fn _print(args: fmt::Arguments) {
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {
-        $crate::uart::_print(format_args!($($arg)*))
+        $crate::drivers::uart::_print(format_args!($($arg)*))
     };
 }
 
@@ -106,10 +102,10 @@ macro_rules! print {
 macro_rules! println {
     () => { $crate::print!("\n") };
     ($fmt:expr) => {
-        $crate::uart::_print(format_args!(concat!($fmt, "\n")))
+        $crate::drivers::uart::_print(format_args!(concat!($fmt, "\n")))
     };
     ($fmt:expr, $($arg:tt)*) => {{
-        $crate::uart::_print(format_args!($fmt, $($arg)*));
-        $crate::uart::_print(format_args!("\n"));
+        $crate::drivers::uart::_print(format_args!($fmt, $($arg)*));
+        $crate::drivers::uart::_print(format_args!("\n"));
     }};
 }

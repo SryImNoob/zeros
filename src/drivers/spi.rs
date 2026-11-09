@@ -12,7 +12,7 @@
 
 #![allow(dead_code)]
 
-use crate::mmio;
+use crate::drivers::mmio;
 
 // ─── SPI0 Register Offsets ───
 const SPI0_BASE: usize = mmio::PERIPHERAL_BASE + 0x0020_4000;
@@ -230,7 +230,7 @@ pub fn write_repeat_u16(cs: u8, word: u16, count: usize) {
     }
 }
 
-/// Send 16-bit words as big-endian bytes over SPI.
+/// Send 16-bit words as big-endian bytes over SPI, draining RX FIFO continuously.
 /// Efficient for framebuffer pixel data (RGB565).
 pub fn write_u16_be(cs: u8, data: &[u16]) {
     unsafe {
@@ -244,18 +244,28 @@ pub fn write_u16_be(cs: u8, data: &[u16]) {
             let lo = (word & 0xFF) as u8;
 
             while mmio::read(SPI_CS) & CS_TXD == 0 {
-                core::hint::spin_loop();
+                while mmio::read(SPI_CS) & CS_RXD != 0 {
+                    let _ = mmio::read(SPI_FIFO);
+                }
             }
             mmio::write(SPI_FIFO, hi as u32);
 
             while mmio::read(SPI_CS) & CS_TXD == 0 {
-                core::hint::spin_loop();
+                while mmio::read(SPI_CS) & CS_RXD != 0 {
+                    let _ = mmio::read(SPI_FIFO);
+                }
             }
             mmio::write(SPI_FIFO, lo as u32);
+
+            while mmio::read(SPI_CS) & CS_RXD != 0 {
+                let _ = mmio::read(SPI_FIFO);
+            }
         }
 
         while mmio::read(SPI_CS) & CS_DONE == 0 {
-            core::hint::spin_loop();
+            while mmio::read(SPI_CS) & CS_RXD != 0 {
+                let _ = mmio::read(SPI_FIFO);
+            }
         }
 
         while mmio::read(SPI_CS) & CS_RXD != 0 {
@@ -263,6 +273,51 @@ pub fn write_u16_be(cs: u8, data: &[u16]) {
         }
 
         mmio::write(SPI_CS, 0);
+    }
+}
+
+/// Full-duplex multi-byte SPI transfer at ~1.5MHz clock (`divider = 256`),
+/// used for the ADS7846 / XPT2046 touch controller on CE1 (`cs = 1`),
+/// then restores the fast 12.5MHz clock (`divider = 32`) for the ILI9341 display.
+pub fn transfer_bytes_slow(cs: u8, tx: &[u8], rx: &mut [u8]) {
+    let len = tx.len().min(rx.len());
+    unsafe {
+        mmio::write(SPI_CLK, 256); // ~1.56 MHz (ADS7846 max is 2 MHz)
+        mmio::write(SPI_CS, CS_CLEAR_RX | CS_CLEAR_TX);
+
+        let cs_val = (cs as u32) & CS_CS_MASK;
+        mmio::write(SPI_CS, cs_val | CS_TA);
+
+        for i in 0..len {
+            let mut timeout = 100_000u32;
+            while mmio::read(SPI_CS) & CS_TXD == 0 {
+                timeout -= 1;
+                if timeout == 0 {
+                    break;
+                }
+            }
+            mmio::write(SPI_FIFO, tx[i] as u32);
+
+            timeout = 100_000;
+            while mmio::read(SPI_CS) & CS_RXD == 0 {
+                timeout -= 1;
+                if timeout == 0 {
+                    break;
+                }
+            }
+            rx[i] = mmio::read(SPI_FIFO) as u8;
+        }
+
+        let mut timeout = 100_000u32;
+        while mmio::read(SPI_CS) & CS_DONE == 0 {
+            timeout -= 1;
+            if timeout == 0 {
+                break;
+            }
+        }
+
+        mmio::write(SPI_CS, 0);
+        mmio::write(SPI_CLK, 32); // Restore 12.5 MHz for ILI9341 LCD
     }
 }
 
