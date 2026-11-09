@@ -57,7 +57,7 @@ static mut EVENT_HEAD: usize = 0;
 static mut EVENT_TAIL: usize = 0;
 
 /// Push an event into the queue
-fn push_event(event: InputEvent) {
+pub fn push_event(event: InputEvent) {
     crate::interrupts::without_interrupts(|| unsafe {
         let next_head = (EVENT_HEAD + 1) % EVENT_QUEUE_SIZE;
         if next_head != EVENT_TAIL {

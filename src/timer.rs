@@ -8,7 +8,6 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::gpio;
 use crate::interrupts;
 
 /// Global tick counter (incremented every timer IRQ)
@@ -73,43 +72,19 @@ pub fn handle_irq() {
     // Poll buttons for debouncing (runs every tick for responsiveness)
     crate::input::poll_buttons();
 
-    // Process any input events
-    while let Some(event) = crate::input::poll_event() {
-        match event {
-            crate::input::InputEvent::ButtonPress(btn) => {
-                crate::println!("[BTN] Button {} pressed", btn + 1);
-            }
-            crate::input::InputEvent::ButtonRelease(btn) => {
-                crate::println!("[BTN] Button {} released", btn + 1);
-            }
-            crate::input::InputEvent::IrCode(code) => {
-                crate::println!("[IR] Code: 0x{:08X}", code);
-            }
-        }
-    }
-
-    // Poll IR decoder
+    // Poll IR decoder and push any decoded frame to the input queue
     unsafe {
-        if let Some(frame) = crate::ir::IR_DECODER.poll() {
-            if frame.is_repeat {
-                crate::println!("[IR] Repeat");
-            } else {
-                crate::println!("[IR] addr=0x{:02X} cmd=0x{:02X}", frame.address, frame.command);
+        let decoder = &mut *core::ptr::addr_of_mut!(crate::ir::IR_DECODER);
+        if let Some(frame) = decoder.poll() {
+            if !frame.is_repeat {
+                let code = ((frame.address as u32) << 8) | (frame.command as u32);
+                crate::input::push_event(crate::input::InputEvent::IrCode(code));
             }
         }
     }
 
-    // Toggle activity LED every second (tick count depends on timer frequency)
-    // Assuming 100Hz timer: toggle every 100 ticks = 1 second
-    if tick % 100 == 0 {
-        gpio::toggle_activity_led();
-    }
-
-    // Print heartbeat every second
-    if tick % 100 == 0 {
-        let seconds = tick / 100;
-        crate::println!("[TICK] {}s uptime", seconds);
-    }
+    // Notify scheduler of timer tick (wakes sleeping tasks & accounts CPU ticks)
+    crate::task::on_tick(tick);
 }
 
 /// Busy-wait delay in milliseconds (uses counter, no IRQ needed)
