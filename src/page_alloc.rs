@@ -89,6 +89,7 @@ pub fn alloc_page() -> Option<usize> {
 
 /// Free a physical page back to the allocator.
 /// The page address must be page-aligned and within managed range.
+#[allow(dead_code)]
 pub fn free_page(addr: usize) {
     assert!(addr % PAGE_SIZE == 0, "free_page: address not page-aligned");
     assert!(addr >= kernel_end_addr() && addr < RAM_END, "free_page: address out of range");

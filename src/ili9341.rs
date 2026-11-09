@@ -10,6 +10,8 @@
 //   GPIO 27            — RST (Hardware Reset)
 //   GPIO 18            — Backlight (PWM capable)
 
+#![allow(dead_code)]
+
 use crate::mmio;
 use crate::spi;
 

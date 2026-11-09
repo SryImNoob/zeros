@@ -16,6 +16,8 @@ use core::fmt;
 const COLS: u32 = 40;
 /// Console rows (240 / 8)
 const ROWS: u32 = 30;
+/// Top row for scrolling console (row 0 is reserved for status bar)
+const TOP_ROW: u32 = 1;
 
 /// Global console instance
 pub static mut CONSOLE: Option<Console> = None;
@@ -31,12 +33,12 @@ pub struct Console {
 pub fn init() {
     let console = Console {
         cursor_col: 0,
-        cursor_row: 0,
+        cursor_row: TOP_ROW,
         fg: colors::GREEN,
         bg: colors::BLACK,
     };
 
-    // Clear screen
+    // Clear screen and draw initial status bar
     unsafe {
         if let Some(ref fb) = *core::ptr::addr_of!(framebuffer::FB) {
             fb.clear(colors::BLACK);
@@ -44,6 +46,25 @@ pub fn init() {
     }
 
     unsafe { CONSOLE = Some(console); }
+    update_status_bar(0, 1, "A");
+}
+
+/// Render the top status bar (row 0, y=0..8)
+pub fn update_status_bar(uptime_sec: u64, tasks: usize, slot: &str) {
+    use core::fmt::Write;
+    let mut bar = alloc::string::String::with_capacity(40);
+    let _ = write!(
+        bar,
+        " ZerOS v0.1 | Slot:{} | Tsk:{} | Up:{}s",
+        slot, tasks, uptime_sec
+    );
+
+    crate::interrupts::without_interrupts(|| unsafe {
+        if let Some(ref fb) = *core::ptr::addr_of!(framebuffer::FB) {
+            fb.fill_rect(0, 0, fb.width, 8, colors::BLUE);
+            fb.draw_str(0, 0, &bar, colors::WHITE, colors::BLUE);
+        }
+    });
 }
 
 impl Console {
@@ -94,10 +115,10 @@ impl Console {
             let pitch_pixels = fb.pitch / 2; // pitch is in bytes, we use u16
             let row_pixels = 8 * pitch_pixels; // pixels per text row
 
-            // Copy rows 1..ROWS to 0..ROWS-1
-            let src = fb.buffer.offset(row_pixels as isize);
-            let dst = fb.buffer;
-            let count = ((ROWS - 1) * row_pixels) as usize;
+            // Copy rows (TOP_ROW+1)..ROWS to TOP_ROW..(ROWS-1)
+            let src = fb.buffer.offset(((TOP_ROW + 1) * row_pixels) as isize);
+            let dst = fb.buffer.offset((TOP_ROW * row_pixels) as isize);
+            let count = ((ROWS - TOP_ROW - 1) * row_pixels) as usize;
             core::ptr::copy(src, dst, count);
 
             // Clear the last row

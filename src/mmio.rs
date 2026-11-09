@@ -1,6 +1,8 @@
 // ZerOS — MMIO (Memory-Mapped I/O) helpers
 // BCM2710 peripheral base: 0x3F000000
 
+#![allow(dead_code)]
+
 use core::ptr;
 
 /// BCM2710 peripheral base address (same as BCM2837 / Pi 3)

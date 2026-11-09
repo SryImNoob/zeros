@@ -3,8 +3,9 @@
 
 KERNEL_ELF = target/aarch64-unknown-none/release/zeros
 KERNEL_IMG = kernel8.img
+SDCARD_IMG = sdcard.img
 
-.PHONY: build clean qemu objdump
+.PHONY: build sdimage clean qemu qemu-display objdump sdcard
 
 # Build the kernel binary
 build:
@@ -14,19 +15,25 @@ build:
 	@echo "✅ Built $(KERNEL_IMG)"
 	@ls -lh $(KERNEL_IMG)
 
-# Run in QEMU (headless, UART only)
-qemu: build
+# Build virtual dual-partition FAT32 SD card image (Slot A + Slot B)
+sdimage: build
+	python3 scripts/mk_sdcard.py $(SDCARD_IMG)
+
+# Run in QEMU (headless, UART only, with FAT32 SD card)
+qemu: sdimage
 	qemu-system-aarch64 \
 		-M raspi3b \
 		-kernel $(KERNEL_IMG) \
+		-drive file=$(SDCARD_IMG),if=sd,format=raw \
 		-serial stdio \
 		-display none
 
-# Run in QEMU with display window (framebuffer visible)
-qemu-display: build
+# Run in QEMU with display window (framebuffer visible, with FAT32 SD card)
+qemu-display: sdimage
 	qemu-system-aarch64 \
 		-M raspi3b \
 		-kernel $(KERNEL_IMG) \
+		-drive file=$(SDCARD_IMG),if=sd,format=raw \
 		-serial stdio
 
 # Disassemble the kernel for debugging
@@ -36,7 +43,7 @@ objdump: build
 # Clean build artifacts
 clean:
 	cargo clean
-	rm -f $(KERNEL_IMG)
+	rm -f $(KERNEL_IMG) $(SDCARD_IMG)
 
 # Copy kernel to mounted SD card (adjust MOUNT_POINT as needed)
 MOUNT_POINT ?= /Volumes/BOOT

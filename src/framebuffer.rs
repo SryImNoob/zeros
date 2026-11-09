@@ -13,6 +13,7 @@ use crate::mailbox;
 pub type Color = u16;
 
 /// Common colors (RGB565 format)
+#[allow(dead_code)]
 pub mod colors {
     use super::Color;
     pub const BLACK: Color = 0x0000;

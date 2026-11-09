@@ -10,6 +10,8 @@
 //   GPIO  8 — CE0 (display chip select)
 //   GPIO  7 — CE1 (touch chip select)
 
+#![allow(dead_code)]
+
 use crate::mmio;
 
 // ─── SPI0 Register Offsets ───

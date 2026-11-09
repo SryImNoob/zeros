@@ -7,7 +7,7 @@
 // M3: Physical page allocator, MMU, kernel heap ✓
 // M4: Framebuffer display + text console + SPI ILI9341 ✓
 // M5: Button & IR input handling ✓
-// M6.1: Multitasking & task scheduler ✓
+// M6: Task scheduler, SD/FAT32 filesystem, Tryboot A/B ✓
 
 #![no_std]
 #![no_main]
@@ -17,6 +17,7 @@ extern crate alloc;
 mod boot;
 mod console;
 mod exception;
+mod fat32;
 mod font;
 mod framebuffer;
 mod gpio;
@@ -29,9 +30,11 @@ mod mailbox;
 mod mmio;
 mod mmu;
 mod page_alloc;
+mod sd;
 mod spi;
 mod task;
 mod timer;
+mod tryboot;
 mod uart;
 
 use core::panic::PanicInfo;
@@ -83,16 +86,34 @@ pub extern "C" fn kernel_main() -> ! {
     // ── Stage 5: Input (buttons + IR) ──
     input::init();
 
-    // ── Stage 6: Task Scheduler ──
+    // ── Stage 6: SD Card + FAT32 Filesystem + Tryboot A/B ──
+    if sd::init() {
+        if fat32::init() {
+            let entries = fat32::list_root();
+            println!("[OK] FAT32 root directory ({} files):", entries.len());
+            for entry in &entries {
+                println!("     - {:<14} {:>7} bytes (cluster {})",
+                    entry.name, entry.size, entry.first_cluster);
+            }
+            if let Some(ver_bytes) = fat32::read_file("VERSION.TXT") {
+                if let Ok(ver_str) = core::str::from_utf8(&ver_bytes) {
+                    println!("[OK] Read VERSION.TXT: {}", ver_str.trim());
+                }
+            }
+        }
+    }
+    tryboot::init();
+
+    // ── Stage 7: Task Scheduler ──
     task::init();
     task::spawn("heartbeat", heartbeat_task);
     task::spawn("input_mon", input_monitor_task);
     task::spawn("self_test", self_test_task);
 
-    // ── Stage 7: Timer (100Hz for responsive input & task wakeup) ──
+    // ── Stage 8: Timer (100Hz for responsive input & task wakeup) ──
     timer::init(100);
 
-    // ── Stage 8: Enable interrupts ──
+    // ── Stage 9: Enable interrupts ──
     interrupts::enable();
     println!("[OK] Interrupts enabled — timer ticking at 100Hz!");
     println!();
@@ -109,14 +130,22 @@ pub extern "C" fn kernel_main() -> ! {
     }
 }
 
-/// Task #1: Periodic heartbeat (1Hz) — toggles LED and prints system status
+/// Task #1: Periodic heartbeat (1Hz) — toggles LED, updates top status bar, prints status
 fn heartbeat_task() {
     let mut seconds = 0u64;
     loop {
         task::sleep_ms(1000);
         seconds += 1;
         gpio::toggle_activity_led();
-        println!("[TICK] {}s uptime (active tasks: {})", seconds, task::active_count());
+
+        let slot_str = match tryboot::status().active_slot {
+            tryboot::BootSlot::SlotA => "A",
+            tryboot::BootSlot::SlotB => "B",
+        };
+        let active = task::active_count();
+        console::update_status_bar(seconds, active, slot_str);
+
+        println!("[TICK] {}s uptime (slot: {}, tasks: {})", seconds, slot_str, active);
         if seconds == 2 {
             task::print_tasks();
         }
@@ -143,18 +172,30 @@ fn input_monitor_task() {
     }
 }
 
-/// Task #3: Background self-test task — runs two steps and exits cleanly
+/// Task #3: Background self-test task — verifies heap & Tryboot A/B persistence
 fn self_test_task() {
     println!("[TASK] self_test: starting background check...");
     task::sleep_ms(500);
 
-    // Test dynamic allocation from a background task stack
+    // 1. Test dynamic allocation from a background task stack
     let mut vec = alloc::vec::Vec::new();
     for i in 1..=10u32 {
         vec.push(i * i);
     }
     let sum: u32 = vec.iter().sum();
     println!("[TASK] self_test: heap check OK (sum of squares 1..10 = {})", sum);
+
+    // 2. Test FAT32 + Tryboot A/B configuration update round-trip
+    if fat32::is_mounted() {
+        let partitions = fat32::partitions();
+        let part_count = partitions.iter().filter(|p| p.is_some()).count();
+        println!("[TASK] self_test: verified {} MBR partitions on SD card", part_count);
+
+        // Test committing Slot A as default (default=1, tryboot=2)
+        if tryboot::set_default_partition(1, 2) {
+            println!("[TASK] self_test: Tryboot A/B commit test OK");
+        }
+    }
 
     task::sleep_ms(500);
 }

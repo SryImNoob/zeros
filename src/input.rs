@@ -12,6 +12,8 @@
 //   - Event queue stores button press/release events
 //   - IR decoding is NEC protocol (38kHz carrier, common for TV remotes)
 
+#![allow(dead_code)]
+
 use crate::mmio;
 use core::sync::atomic::{AtomicU32, Ordering};
 
