@@ -1,7 +1,11 @@
-// ZerOS — UART driver (PL011)
-// Used for serial debug output via QEMU
+// ZerOS — UART driver (PL011) + print macros
+//
+// Provides serial debug output via the PL011 UART.
+// In QEMU: output appears on `-serial stdio`
+// On real hardware: accessible via mini-HDMI or USB serial (if configured)
 
 use crate::mmio;
+use core::fmt;
 
 const UART_DR: usize = mmio::UART0_BASE;           // Data register
 const UART_FR: usize = mmio::UART0_BASE + 0x18;    // Flag register
@@ -17,19 +21,17 @@ const FR_TXFF: u32 = 1 << 5;  // Transmit FIFO full
 /// Initialize UART0 (PL011)
 pub fn init() {
     unsafe {
-        // Disable UART
+        // Disable UART during configuration
         mmio::write(UART_CR, 0);
 
         // Clear all interrupts
         mmio::write(UART_ICR, 0x7FF);
 
         // Set baud rate: 115200 @ 48MHz clock
-        // Divider = 48000000 / (16 * 115200) = 26.0417
-        // Integer part = 26, Fractional part = 0.0417 * 64 + 0.5 = 3
         mmio::write(UART_IBRD, 26);
         mmio::write(UART_FBRD, 3);
 
-        // 8-bit, no parity, FIFO enabled
+        // 8-bit word length, FIFO enabled, no parity
         mmio::write(UART_LCRH, (1 << 4) | (1 << 5) | (1 << 6));
 
         // Enable UART, TX and RX
@@ -56,4 +58,44 @@ pub fn puts(s: &str) {
         }
         putc(byte);
     }
+}
+
+// ─── fmt::Write support for print!/println! macros ───
+
+/// Writer type for UART output
+pub struct Writer;
+
+impl fmt::Write for Writer {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        puts(s);
+        Ok(())
+    }
+}
+
+/// Internal print helper — used by print! and println! macros
+#[doc(hidden)]
+pub fn _print(args: fmt::Arguments) {
+    use fmt::Write;
+    Writer.write_fmt(args).unwrap();
+}
+
+/// Print formatted text to UART (no newline)
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => {
+        $crate::uart::_print(format_args!($($arg)*))
+    };
+}
+
+/// Print formatted text to UART (with newline)
+#[macro_export]
+macro_rules! println {
+    () => { $crate::print!("\n") };
+    ($fmt:expr) => {
+        $crate::uart::_print(format_args!(concat!($fmt, "\n")))
+    };
+    ($fmt:expr, $($arg:tt)*) => {{
+        $crate::uart::_print(format_args!($fmt, $($arg)*));
+        $crate::uart::_print(format_args!("\n"));
+    }};
 }
