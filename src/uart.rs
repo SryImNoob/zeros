@@ -72,11 +72,21 @@ impl fmt::Write for Writer {
     }
 }
 
-/// Internal print helper — used by print! and println! macros
+/// Internal print helper — used by print! and println! macros.
+/// Writes to UART and (if initialized) the screen console.
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
-    use fmt::Write;
-    Writer.write_fmt(args).unwrap();
+    crate::interrupts::without_interrupts(|| {
+        use fmt::Write;
+        // Always write to UART
+        Writer.write_fmt(args).unwrap();
+        // Also write to screen console if available
+        unsafe {
+            if let Some(ref mut console) = crate::console::CONSOLE {
+                console.write_fmt(args).ok();
+            }
+        }
+    });
 }
 
 /// Print formatted text to UART (no newline)

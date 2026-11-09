@@ -8,10 +8,13 @@
 //   L2 table → 512 entries × 2MB each
 //
 // Memory map:
-//   0x00000000 - 0x1FFFFFFF : Normal memory (RAM, 512MB, WB cacheable)
-//   0x20000000 - 0x3EFFFFFF : Unmapped (fault on access)
+//   0x00000000 - 0x3EFFFFFF : Normal memory (RAM, ~1008MB, WB cacheable)
 //   0x3F000000 - 0x3FFFFFFF : Device memory (BCM2710 peripherals)
 //   0x40000000 - 0x401FFFFF : Device memory (ARM local peripherals)
+//
+// NOTE: QEMU raspi3b has 1GB RAM. The GPU allocates framebuffer at
+// high RAM addresses (e.g. 0x3C100000), so we must map all RAM
+// up to 0x3F000000 — not just 512MB.
 
 use crate::page_alloc;
 
@@ -44,8 +47,9 @@ const DEVICE_BLOCK: u64 = BLOCK_DESC | ATTR_DEVICE | AF;
 /// 2MB block size
 const BLOCK_2MB: usize = 2 * 1024 * 1024;
 
-/// Number of 2MB blocks for 512MB RAM
-const RAM_BLOCKS: usize = 256; // 256 × 2MB = 512MB
+/// Number of 2MB blocks for RAM (up to peripheral base at 0x3F000000)
+/// 0x3F000000 / 2MB = 504 blocks. Entry 504 starts at 0x3F000000 (peripherals).
+const RAM_BLOCKS: usize = 504; // 504 × 2MB = 1008MB (covers all RAM before peripherals)
 
 /// Initialize the MMU with identity mapping and enable it.
 pub fn init() {
@@ -61,13 +65,14 @@ pub fn init() {
     unsafe {
         // ── Fill L2_0: covers 0x00000000 - 0x3FFFFFFF (0-1GB) ──
 
-        // RAM: entries 0..255 → 0x00000000 - 0x1FFFFFFF (512MB, normal memory)
+        // RAM: entries 0..503 → 0x00000000 - 0x3EFFFFFF (~1008MB, normal memory)
+        // This covers all RAM including GPU-allocated framebuffer at high addresses.
         for i in 0..RAM_BLOCKS {
             let addr = (i * BLOCK_2MB) as u64;
             *l2_0.add(i) = addr | NORMAL_BLOCK;
         }
 
-        // Entries 256..503 remain 0 (invalid — unmapped gap)
+        // Entry 504 starts at 0x3F000000 — no unmapped gap anymore
 
         // Peripherals: entries 504..511 → 0x3F000000 - 0x3FFFFFFF (device memory)
         for i in 504..512 {

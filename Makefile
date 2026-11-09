@@ -14,13 +14,20 @@ build:
 	@echo "✅ Built $(KERNEL_IMG)"
 	@ls -lh $(KERNEL_IMG)
 
-# Run in QEMU (raspi3b is compatible with Zero 2 W's Cortex-A53)
+# Run in QEMU (headless, UART only)
 qemu: build
 	qemu-system-aarch64 \
 		-M raspi3b \
 		-kernel $(KERNEL_IMG) \
 		-serial stdio \
 		-display none
+
+# Run in QEMU with display window (framebuffer visible)
+qemu-display: build
+	qemu-system-aarch64 \
+		-M raspi3b \
+		-kernel $(KERNEL_IMG) \
+		-serial stdio
 
 # Disassemble the kernel for debugging
 objdump: build
