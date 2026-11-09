@@ -20,7 +20,9 @@ mod framebuffer;
 mod gpio;
 mod heap;
 mod ili9341;
+mod input;
 mod interrupts;
+mod ir;
 mod mailbox;
 mod mmio;
 mod mmu;
@@ -75,12 +77,15 @@ pub extern "C" fn kernel_main() -> ! {
         }
     }
 
-    // ── Stage 5: Timer ──
-    timer::init(1);
+    // ── Stage 5: Input (buttons + IR) ──
+    input::init();
 
-    // ── Stage 6: Enable interrupts ──
+    // ── Stage 6: Timer (100Hz for responsive input polling) ──
+    timer::init(100);
+
+    // ── Stage 7: Enable interrupts ──
     interrupts::enable();
-    println!("[OK] Interrupts enabled — timer ticking!");
+    println!("[OK] Interrupts enabled — timer ticking at 100Hz!");
     println!();
     println!("ZerOS is ready. Free pages: {} ({}MB)",
         page_alloc::free_count(),

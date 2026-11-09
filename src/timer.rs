@@ -70,11 +70,46 @@ pub fn handle_irq() {
         core::arch::asm!("msr cntp_tval_el0, {}", in(reg) INTERVAL);
     }
 
-    // Toggle activity LED on each tick
-    gpio::toggle_activity_led();
+    // Poll buttons for debouncing (runs every tick for responsiveness)
+    crate::input::poll_buttons();
 
-    // Print tick every second (if hz > 1, adjust accordingly)
-    crate::println!("[TICK] #{}", tick);
+    // Process any input events
+    while let Some(event) = crate::input::poll_event() {
+        match event {
+            crate::input::InputEvent::ButtonPress(btn) => {
+                crate::println!("[BTN] Button {} pressed", btn + 1);
+            }
+            crate::input::InputEvent::ButtonRelease(btn) => {
+                crate::println!("[BTN] Button {} released", btn + 1);
+            }
+            crate::input::InputEvent::IrCode(code) => {
+                crate::println!("[IR] Code: 0x{:08X}", code);
+            }
+        }
+    }
+
+    // Poll IR decoder
+    unsafe {
+        if let Some(frame) = crate::ir::IR_DECODER.poll() {
+            if frame.is_repeat {
+                crate::println!("[IR] Repeat");
+            } else {
+                crate::println!("[IR] addr=0x{:02X} cmd=0x{:02X}", frame.address, frame.command);
+            }
+        }
+    }
+
+    // Toggle activity LED every second (tick count depends on timer frequency)
+    // Assuming 100Hz timer: toggle every 100 ticks = 1 second
+    if tick % 100 == 0 {
+        gpio::toggle_activity_led();
+    }
+
+    // Print heartbeat every second
+    if tick % 100 == 0 {
+        let seconds = tick / 100;
+        crate::println!("[TICK] {}s uptime", seconds);
+    }
 }
 
 /// Busy-wait delay in milliseconds (uses counter, no IRQ needed)
