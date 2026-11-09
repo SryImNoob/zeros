@@ -3,19 +3,27 @@
 // Hardware: RPi Zero 2 W (BCM2710A1, Cortex-A53) + Argon POD (ILI9341 2.8" LCD)
 //
 // M1: Minimal boot + UART ✓
-// M2: Exception handling, interrupts, timer, GPIO
+// M2: Exception handling, interrupts, timer, GPIO ✓
+// M3: Physical page allocator, MMU, kernel heap
 
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 mod boot;
 mod exception;
 mod gpio;
+mod heap;
 mod interrupts;
 mod mmio;
+mod mmu;
+mod page_alloc;
 mod timer;
 mod uart;
 
+use alloc::string::String;
+use alloc::vec::Vec;
 use core::panic::PanicInfo;
 
 /// Kernel entry point — called from boot stub after EL2→EL1 transition
@@ -38,15 +46,29 @@ pub extern "C" fn kernel_main() -> ! {
     // ── Stage 2: GPIO (activity LED) ──
     gpio::init();
 
-    // ── Stage 3: Timer (1 Hz periodic tick) ──
-    timer::init(1); // 1 tick per second
+    // ── Stage 3: Memory management ──
+    // 3a: Kernel heap (fixed region after kernel image)
+    let kernel_end = page_alloc::kernel_end_addr();
+    let heap_end = heap::init(kernel_end);
 
-    // ── Stage 4: Enable interrupts ──
+    // 3b: Physical page allocator (free pages after heap)
+    let pages_start = page_alloc::align_up(heap_end, page_alloc::PAGE_SIZE);
+    page_alloc::init(pages_start);
+
+    // 3c: MMU (identity mapping, enables caches)
+    mmu::init();
+
+    // ── Stage 4: Demo — alloc crate works! ──
+    demo_alloc();
+
+    // ── Stage 5: Timer (1 Hz periodic tick) ──
+    timer::init(1);
+
+    // ── Stage 6: Enable interrupts ──
     interrupts::enable();
     println!("[OK] Interrupts enabled — timer ticking!");
     println!();
 
-    // TODO: M3 — Initialize memory management (MMU, page allocator)
     // TODO: M4 — Initialize SPI + ILI9341 display driver
     // TODO: M5 — Initialize button & IR input
     // TODO: M6 — Initialize task scheduler
@@ -59,10 +81,44 @@ pub extern "C" fn kernel_main() -> ! {
     }
 }
 
-/// Panic handler — prints the panic message via UART and halts
+/// Demonstrate that dynamic allocation works
+fn demo_alloc() {
+    println!();
+    println!("[demo] Testing alloc crate...");
+
+    // Vec
+    let mut v: Vec<u32> = Vec::new();
+    for i in 0..10 {
+        v.push(i * i);
+    }
+    println!("[demo] Vec<u32>: {:?}", v.as_slice());
+
+    // String
+    let s = String::from("Hello from ZerOS heap!");
+    println!("[demo] String: {}", s);
+
+    // Box
+    let boxed = alloc::boxed::Box::new(42u64);
+    println!("[demo] Box<u64>: {}", *boxed);
+
+    // Heap stats
+    let (used, total) = heap::stats();
+    println!("[demo] Heap: {}/{} bytes used", used, total);
+
+    // Free pages
+    println!("[demo] Free pages: {} ({}MB)", 
+        page_alloc::free_count(),
+        page_alloc::free_count() * page_alloc::PAGE_SIZE / 1024 / 1024);
+
+    println!("[demo] alloc crate works!");
+    println!();
+
+    // v, s, boxed are dropped here — memory freed back to heap
+}
+
+/// Panic handler
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    // Disable interrupts to prevent re-entry
     interrupts::disable();
 
     println!();

@@ -33,6 +33,10 @@ SECTIONS
         __bss_end = .;
     }
 
+    /* Page-aligned kernel end — used by page allocator */
+    . = ALIGN(4096);
+    __kernel_end = .;
+
     /* Stack grows downward from _start (0x80000) */
 
     /DISCARD/ : {

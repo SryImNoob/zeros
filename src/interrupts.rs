@@ -64,3 +64,22 @@ pub fn disable() {
         core::arch::asm!("msr daifset, #2"); // Set IRQ mask bit
     }
 }
+
+/// Execute a closure with IRQs disabled, restoring previous state afterward.
+/// Prevents race conditions between IRQ handlers and kernel code.
+pub fn without_interrupts<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let daif: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, daif", out(reg) daif);
+        core::arch::asm!("msr daifset, #2"); // Disable IRQs
+    }
+    let result = f();
+    if daif & (1 << 7) == 0 {
+        // IRQs were enabled before — re-enable
+        enable();
+    }
+    result
+}
