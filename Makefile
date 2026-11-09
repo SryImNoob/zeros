@@ -5,7 +5,10 @@ KERNEL_ELF = target/aarch64-unknown-none/release/zeros
 KERNEL_IMG = kernel8.img
 SDCARD_IMG = sdcard.img
 
-.PHONY: build sdimage clean qemu qemu-display objdump sdcard
+# Load local git-ignored configuration (e.g. RPI_HOST)
+-include local.mk
+
+.PHONY: build sdimage clean qemu qemu-display objdump sdcard deploy tryboot
 
 # Build the kernel binary
 build:
@@ -55,3 +58,19 @@ sdcard: build
 	else \
 		echo "❌ SD card not mounted at $(MOUNT_POINT)"; \
 	fi
+
+# Deploy zeros.img + tryboot.txt to Raspberry Pi over SSH (uses RPI_HOST from local.mk)
+deploy: build
+	@if [ -z "$(RPI_HOST)" ]; then \
+		echo "❌ RPI_HOST is not set in local.mk"; exit 1; \
+	fi
+	scp $(KERNEL_IMG) $(RPI_HOST):/tmp/zeros.img
+	ssh -t $(RPI_HOST) 'BOOT_DIR=/boot/firmware; [ ! -d "$$BOOT_DIR" ] && BOOT_DIR=/boot; \
+		sudo cp /tmp/zeros.img $$BOOT_DIR/zeros.img && \
+		printf "arm_64bit=1\nkernel=zeros.img\nkernel_address=0x80000\nenable_uart=1\ndtparam=spi=on\n" | sudo tee $$BOOT_DIR/tryboot.txt > /dev/null && \
+		echo "✅ Deployed zeros.img and tryboot.txt to $$BOOT_DIR on $(RPI_HOST)"'
+
+# Deploy and immediately one-shot reboot into ZerOS via tryboot
+tryboot: deploy
+	ssh -t $(RPI_HOST) 'sudo reboot "0 tryboot"' || true
+	@echo "🚀 Rebooting $(RPI_HOST) into ZerOS (one-time tryboot)..."

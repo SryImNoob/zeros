@@ -114,7 +114,8 @@ pub fn poll_buttons() {
     static SKIP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
     static FIRST_POLL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
-    if FIRST_POLL.swap(false, Ordering::Relaxed) {
+    if FIRST_POLL.load(Ordering::Relaxed) {
+        FIRST_POLL.store(false, Ordering::Relaxed);
         let raw = read_buttons_raw();
         if raw == 0x0F {
             // All 4 buttons "pressed" = QEMU, skip all polling

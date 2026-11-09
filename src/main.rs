@@ -42,6 +42,11 @@ use core::panic::PanicInfo;
 /// Kernel entry point
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
+    // ── Stage 0: Arm hardware watchdog (15s auto-recovery on real hardware) ──
+    if !timer::is_qemu() {
+        tryboot::watchdog_start(15);
+    }
+
     // ── Stage 1: UART ──
     uart::init();
     println!();
@@ -66,18 +71,20 @@ pub extern "C" fn kernel_main() -> ! {
     mmu::init();
 
     // ── Stage 4: Display + Console ──
-    // Initialize GPU framebuffer (works in QEMU and HDMI).
-    // On real hardware (!timer::is_qemu()), ALSO initialize the Argon POD
-    // SPI0 + ILI9341 2.8" LCD so output is mirrored to the physical POD screen!
-    let fb_ok = framebuffer::init(320, 240);
-    let mut spi_ok = false;
-    if !timer::is_qemu() {
+    // In QEMU: use VideoCore GPU framebuffer (320×240 window).
+    // On real Argon POD hardware: drive the 2.8" ILI9341 LCD directly over SPI0!
+    let display_ok = if timer::is_qemu() {
+        framebuffer::init(320, 240)
+    } else {
         spi::init();
-        spi_ok = ili9341::init();
-    }
-    if fb_ok || spi_ok {
+        let ok = ili9341::init();
+        tryboot::watchdog_feed(15);
+        ok
+    };
+    if display_ok {
         console::init();
-        println!("[OK] Console: 40x30 text + status bar (FB={}, SPI_LCD={})", fb_ok, spi_ok);
+        println!("== ZerOS v0.1.0 (AArch64 Bare-Metal) ==");
+        println!("[OK] Console: 40x30 text + status bar");
     }
 
     // ── Stage 5: Input (buttons + IR) ──
@@ -85,16 +92,24 @@ pub extern "C" fn kernel_main() -> ! {
 
     // ── Stage 6: SD Card + FAT32 Filesystem + Tryboot A/B ──
     if sd::init() {
+        if !timer::is_qemu() {
+            tryboot::watchdog_feed(15);
+        }
         if fat32::init() {
             let entries = fat32::list_root();
             println!("[OK] FAT32 root directory ({} files):", entries.len());
-            for entry in &entries {
+            for entry in entries.iter().take(6) {
                 println!("     - {:<14} {:>7} bytes (cluster {})",
                     entry.name, entry.size, entry.first_cluster);
             }
             if let Some(ver_bytes) = fat32::read_file("VERSION.TXT") {
                 if let Ok(ver_str) = core::str::from_utf8(&ver_bytes) {
                     println!("[OK] Read VERSION.TXT: {}", ver_str.trim());
+                }
+            } else if let Some(tb_bytes) = fat32::read_file("TRYBOOT.TXT") {
+                if let Ok(tb_str) = core::str::from_utf8(&tb_bytes) {
+                    let first_line = tb_str.lines().next().unwrap_or("");
+                    println!("[OK] Read TRYBOOT.TXT ({}B, {})", tb_bytes.len(), first_line);
                 }
             }
         }
@@ -133,6 +148,9 @@ fn heartbeat_task() {
     loop {
         task::sleep_ms(1000);
         seconds += 1;
+        if !timer::is_qemu() {
+            tryboot::watchdog_feed(15);
+        }
         gpio::toggle_activity_led();
 
         let slot_str = match tryboot::status().active_slot {
@@ -145,6 +163,13 @@ fn heartbeat_task() {
         println!("[TICK] {}s uptime (slot: {}, tasks: {})", seconds, slot_str, active);
         if seconds == 2 {
             task::print_tasks();
+            if !timer::is_qemu() {
+                println!("[TIP] Press Button 4 (or wait 45s) to return to RPi OS");
+            }
+        }
+        if !timer::is_qemu() && seconds >= 45 {
+            println!("[SYS] 45s tryboot session complete -> rebooting to RPi OS...");
+            tryboot::reboot_to_partition(0);
         }
     }
 }

@@ -1,3 +1,5 @@
 /target
 kernel8.img
 sdcard.img
+local.mk
+.env*

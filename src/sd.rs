@@ -96,10 +96,46 @@ static mut SD_STATE: SdState = SdState {
     is_sdhc: false,
 };
 
+/// Route the Arasan EMMC controller (0x3F30_0000) to the physical microSD slot (GPIO 48..53)
+/// and disconnect it from the Wi-Fi SDIO chip (GPIO 34..39) on real RPi Zero 2 W hardware.
+unsafe fn route_emmc_to_sdcard() {
+    const GPFSEL3: usize = mmio::GPIO_BASE + 0x0C; // GPIO 30..39
+    const GPFSEL4: usize = mmio::GPIO_BASE + 0x10; // GPIO 40..49
+    const GPFSEL5: usize = mmio::GPIO_BASE + 0x14; // GPIO 50..53
+
+    // Set GPIO 34..39 to INPUT (0b000) so EMMC disconnects from Wi-Fi SDIO
+    let mut fsel3 = mmio::read(GPFSEL3);
+    for pin in 34..=39 {
+        let shift = (pin - 30) * 3;
+        fsel3 &= !(0b111 << shift);
+    }
+    mmio::write(GPFSEL3, fsel3);
+
+    // Set GPIO 48..49 to ALT3 (0b111) for EMMC SD_CLK / SD_CMD
+    let mut fsel4 = mmio::read(GPFSEL4);
+    for pin in 48..=49 {
+        let shift = (pin - 40) * 3;
+        fsel4 = (fsel4 & !(0b111 << shift)) | (0b111 << shift);
+    }
+    mmio::write(GPFSEL4, fsel4);
+
+    // Set GPIO 50..53 to ALT3 (0b111) for EMMC SD_DAT0..3
+    let mut fsel5 = mmio::read(GPFSEL5);
+    for pin in 50..=53 {
+        let shift = (pin - 50) * 3;
+        fsel5 = (fsel5 & !(0b111 << shift)) | (0b111 << shift);
+    }
+    mmio::write(GPFSEL5, fsel5);
+}
+
 /// Initialize the EMMC controller and SD card.
 /// Returns `true` if a card was detected and initialized.
 pub fn init() -> bool {
     unsafe {
+        if !crate::timer::is_qemu() {
+            route_emmc_to_sdcard();
+        }
+
         // 1. Reset the Host Controller
         mmio::write(EMMC_CONTROL0, 0);
         mmio::write(EMMC_CONTROL1, CTRL1_SRST_HC);

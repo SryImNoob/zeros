@@ -65,9 +65,10 @@ pub fn init(hz: u64) {
     interrupts::enable_timer_irq();
 }
 
-/// Handle timer IRQ — called from irq_dispatch
+/// Handle timer IRQ — called from irq_dispatch (with IRQs masked on core 0)
 pub fn handle_irq() {
-    let tick = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    let tick = TICKS.load(Ordering::Relaxed) + 1;
+    TICKS.store(tick, Ordering::Relaxed);
 
     // Reload timer for next interrupt
     unsafe {

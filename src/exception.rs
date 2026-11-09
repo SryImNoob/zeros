@@ -32,7 +32,7 @@ global_asm!(r#"
 
 // ---- Context save macro ----
 .macro EXCEPTION_SAVE
-    sub     sp, sp, #280            // 31 regs + elr + spsr + esr = 34 * 8 = 272, round to 280 (16-aligned)
+    sub     sp, sp, #272            // 31 regs + elr + spsr + esr = 34 * 8 = 272 (17 * 16, 16-byte aligned!)
     stp     x0,  x1,  [sp, #0]
     stp     x2,  x3,  [sp, #16]
     stp     x4,  x5,  [sp, #32]
@@ -77,7 +77,7 @@ global_asm!(r#"
     ldp     x26, x27, [sp, #208]
     ldp     x28, x29, [sp, #224]
     ldr     x30, [sp, #240]
-    add     sp, sp, #280
+    add     sp, sp, #272
     eret
 .endm
 

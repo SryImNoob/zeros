@@ -4,11 +4,11 @@
 // This driver handles the hardware-specific initialization and pixel output
 // for the real display. On QEMU, use the GPU framebuffer (framebuffer.rs) instead.
 //
-// Argon POD pin mapping:
-//   SPI0 CE0 (GPIO 8)  — Chip Select
-//   GPIO 25            — DC (Data/Command select)
-//   GPIO 27            — RST (Hardware Reset)
-//   GPIO 18            — Backlight (PWM capable)
+// Argon POD pin mapping (verified from /boot/firmware/overlays/tft9341.dtbo & argonpodd.py):
+//   SPI0 CE0 (GPIO 8)  — Chip Select (reg = <0>)
+//   GPIO 22 (0x16)     — DC (Data/Command select: dc-gpios = <&gpio 22 0>)
+//   GPIO 27 (0x1b)     — RST (Hardware Reset: reset-gpios = <&gpio 27 1>)
+//   GPIO 18            — Backlight (PIN_BRIGHTNESS = 18)
 
 #![allow(dead_code)]
 
@@ -16,10 +16,10 @@ use crate::mmio;
 use crate::spi;
 
 // ─── GPIO pins for the Argon POD ILI9341 ───
-const PIN_DC:      u32 = 25;  // Data/Command select: LOW=command, HIGH=data
-const PIN_RST:     u32 = 27;  // Hardware reset (active low)
-const PIN_RST_ALT: u32 = 24;  // Alternate reset pin on some tft9341 revisions
-const PIN_BL:      u32 = 18;  // Backlight control
+const PIN_DC:      u32 = 22;  // Data/Command select: LOW=command, HIGH=data (0x16 in tft9341.dtbo)
+const PIN_RST:     u32 = 27;  // Hardware reset (active low, 0x1b in tft9341.dtbo)
+const PIN_RST_ALT: u32 = 25;  // Alternate reset pin on generic ILI9341 hats
+const PIN_BL:      u32 = 18;  // Backlight control (GPIO 18 in argonpodd.py)
 
 /// Display SPI chip select (CE0)
 const SPI_CS_DISPLAY: u8 = 0;
@@ -112,10 +112,10 @@ pub fn init() -> bool {
     write_cmd(CMD_VCOM_CTRL2);
     write_data(&[0x86]);
 
-    // Memory Access Control: landscape, RGB
-    // MV | MX = rotate 270° for Argon POD orientation
+    // Memory Access Control: landscape 270° rotation for Argon POD (MV | BGR)
+    // Note: MY flips the horizontal (320) axis when MV=1; clearing MY fixes horizontal mirror!
     write_cmd(CMD_MEM_ACCESS);
-    write_data(&[MADCTL_MV | MADCTL_MX | MADCTL_BGR]);
+    write_data(&[MADCTL_MV | MADCTL_BGR]);
 
     // Pixel format: 16-bit RGB565
     write_cmd(CMD_PIXEL_FORMAT);
@@ -133,14 +133,17 @@ pub fn init() -> bool {
     write_cmd(CMD_SLEEP_OUT);
     delay_ms(120);
 
-    // Display ON
-    write_cmd(CMD_DISPLAY_ON);
-    delay_ms(20);
-
     let display = Ili9341 {
         width: WIDTH,
         height: HEIGHT,
     };
+
+    // Clear GRAM to black BEFORE turning display on so there is no white snow flash
+    display.clear(0x0000);
+
+    // Display ON
+    write_cmd(CMD_DISPLAY_ON);
+    delay_ms(20);
 
     crate::println!("[OK] ILI9341: {}x{} RGB565 display initialized (SPI)", WIDTH, HEIGHT);
 
@@ -174,36 +177,19 @@ impl Ili9341 {
         write_data(&[(color >> 8) as u8, (color & 0xFF) as u8]);
     }
 
-    /// Fill a rectangle with a solid color
+    /// Fill a rectangle with a solid color in a single uninterrupted SPI burst
     pub fn fill_rect(&self, x: u32, y: u32, w: u32, h: u32, color: u16) {
+        if x >= self.width || y >= self.height || w == 0 || h == 0 {
+            return;
+        }
         let x1 = (x + w - 1).min(self.width - 1);
         let y1 = (y + h - 1).min(self.height - 1);
+        let total_pixels = ((x1 - x + 1) * (y1 - y + 1)) as usize;
+
         self.set_window(x as u16, y as u16, x1 as u16, y1 as u16);
-
         write_cmd(CMD_MEM_WRITE);
-
-        // Send pixel data in chunks for efficiency
-        let total_pixels = (w * h) as usize;
-        let hi = (color >> 8) as u8;
-        let lo = (color & 0xFF) as u8;
-
-        // Use a small buffer for burst writes
-        const CHUNK: usize = 64;
-        let mut buf = [0u8; CHUNK * 2];
-        for i in 0..CHUNK {
-            buf[i * 2] = hi;
-            buf[i * 2 + 1] = lo;
-        }
-
-        let full_chunks = total_pixels / CHUNK;
-        let remainder = total_pixels % CHUNK;
-
-        for _ in 0..full_chunks {
-            write_data(&buf);
-        }
-        if remainder > 0 {
-            write_data(&buf[..remainder * 2]);
-        }
+        gpio_set(PIN_DC, true); // Data mode
+        spi::write_repeat_u16(SPI_CS_DISPLAY, color, total_pixels);
     }
 
     /// Clear the entire display

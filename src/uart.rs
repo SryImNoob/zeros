@@ -39,11 +39,15 @@ pub fn init() {
     }
 }
 
-/// Send a single character
+/// Send a single character (with timeout so stalled/unrouted UART never blocks boot)
 pub fn putc(c: u8) {
     unsafe {
-        // Wait until TX FIFO is not full
+        let mut timeout = 2000u32;
         while mmio::read(UART_FR) & FR_TXFF != 0 {
+            timeout -= 1;
+            if timeout == 0 {
+                return;
+            }
             core::hint::spin_loop();
         }
         mmio::write(UART_DR, c as u32);

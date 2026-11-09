@@ -68,14 +68,13 @@ pub fn init() {
         // Clear FIFOs and reset
         mmio::write(SPI_CS, CS_CLEAR_RX | CS_CLEAR_TX);
 
-        // Set clock divider for ~16MHz SPI clock
-        // Core clock is ~250MHz on QEMU/real hardware
-        // Divider = 250MHz / 16MHz ≈ 16
-        // ILI9341 max SPI write clock is ~32MHz, read is ~6.67MHz
-        mmio::write(SPI_CLK, 16);
+        // Set clock divider for ~12.5MHz SPI clock
+        // Core clock on RPi Zero 2 W is 400MHz (250MHz in QEMU)
+        // Divider = 32 → 400MHz / 32 = 12.5MHz (within tft9341.dtbo's 16MHz max)
+        mmio::write(SPI_CLK, 32);
     }
 
-    crate::println!("[OK] SPI0: initialized, clock divider=16 (~16MHz)");
+    crate::println!("[OK] SPI0: initialized, clock divider=32 (~12.5MHz)");
 }
 
 /// Transfer a single byte over SPI (full-duplex: sends and receives).
@@ -123,8 +122,9 @@ pub fn transfer_byte(cs: u8, tx: u8) -> u8 {
     }
 }
 
-/// Send a buffer of bytes over SPI (TX only, ignoring RX).
-/// Uses polling mode with FIFO for reasonable throughput.
+/// Send a buffer of bytes over SPI (TX only, draining RX FIFO continuously).
+/// IMPORTANT: BCM2835/2710 SPI0 has a 64-byte RX FIFO. If RX FIFO becomes full
+/// during a transfer, the hardware halts transmission until RX FIFO is read!
 /// `cs` selects the chip: 0 = CE0 (display), 1 = CE1 (touch).
 pub fn write_bytes(cs: u8, data: &[u8]) {
     unsafe {
@@ -136,9 +136,17 @@ pub fn write_bytes(cs: u8, data: &[u8]) {
         mmio::write(SPI_CS, cs_val | CS_TA);
 
         for &byte in data {
+            // Drain RX FIFO so it never fills up and stalls the SPI clock
+            while mmio::read(SPI_CS) & CS_RXD != 0 {
+                let _ = mmio::read(SPI_FIFO);
+            }
+
             // Wait for TX FIFO space
             let mut timeout = 100_000u32;
             while mmio::read(SPI_CS) & CS_TXD == 0 {
+                while mmio::read(SPI_CS) & CS_RXD != 0 {
+                    let _ = mmio::read(SPI_FIFO);
+                }
                 timeout -= 1;
                 if timeout == 0 {
                     mmio::write(SPI_CS, 0);
@@ -149,9 +157,12 @@ pub fn write_bytes(cs: u8, data: &[u8]) {
             mmio::write(SPI_FIFO, byte as u32);
         }
 
-        // Wait for transfer complete
+        // Wait for transfer complete, draining RX FIFO along the way
         let mut timeout = 100_000u32;
         while mmio::read(SPI_CS) & CS_DONE == 0 {
+            while mmio::read(SPI_CS) & CS_RXD != 0 {
+                let _ = mmio::read(SPI_FIFO);
+            }
             timeout -= 1;
             if timeout == 0 {
                 break;
@@ -159,14 +170,62 @@ pub fn write_bytes(cs: u8, data: &[u8]) {
             core::hint::spin_loop();
         }
 
-        // Drain RX FIFO
-        timeout = 10_000;
-        while mmio::read(SPI_CS) & CS_RXD != 0 && timeout > 0 {
+        // Drain any remaining bytes in RX FIFO
+        while mmio::read(SPI_CS) & CS_RXD != 0 {
             let _ = mmio::read(SPI_FIFO);
-            timeout -= 1;
         }
 
         // Deassert CS
+        mmio::write(SPI_CS, 0);
+    }
+}
+
+/// Repeat a 16-bit big-endian color word `count` times in a single CS-asserted SPI burst.
+/// Drains RX FIFO continuously so transfers of any size (e.g. 320×240 = 76,800 pixels)
+/// stream at full SPI speed without stalling or toggling CS.
+pub fn write_repeat_u16(cs: u8, word: u16, count: usize) {
+    let hi = (word >> 8) as u32;
+    let lo = (word & 0xFF) as u32;
+
+    unsafe {
+        mmio::write(SPI_CS, CS_CLEAR_RX | CS_CLEAR_TX);
+
+        let cs_val = (cs as u32) & CS_CS_MASK;
+        mmio::write(SPI_CS, cs_val | CS_TA);
+
+        for _ in 0..count {
+            // Send high byte
+            while mmio::read(SPI_CS) & CS_TXD == 0 {
+                while mmio::read(SPI_CS) & CS_RXD != 0 {
+                    let _ = mmio::read(SPI_FIFO);
+                }
+            }
+            mmio::write(SPI_FIFO, hi);
+
+            // Send low byte
+            while mmio::read(SPI_CS) & CS_TXD == 0 {
+                while mmio::read(SPI_CS) & CS_RXD != 0 {
+                    let _ = mmio::read(SPI_FIFO);
+                }
+            }
+            mmio::write(SPI_FIFO, lo);
+
+            // Opportunistically drain RX FIFO
+            while mmio::read(SPI_CS) & CS_RXD != 0 {
+                let _ = mmio::read(SPI_FIFO);
+            }
+        }
+
+        while mmio::read(SPI_CS) & CS_DONE == 0 {
+            while mmio::read(SPI_CS) & CS_RXD != 0 {
+                let _ = mmio::read(SPI_FIFO);
+            }
+        }
+
+        while mmio::read(SPI_CS) & CS_RXD != 0 {
+            let _ = mmio::read(SPI_FIFO);
+        }
+
         mmio::write(SPI_CS, 0);
     }
 }

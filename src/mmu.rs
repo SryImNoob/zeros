@@ -94,22 +94,22 @@ pub fn init() {
         // ── Configure MMU registers ──
 
         // MAIR_EL1: Memory Attribute Indirection Register
-        //   Attr0 [7:0]  = 0xFF → Normal, Write-Back, RW-Allocate
+        //   Attr0 [7:0]  = 0x44 → Normal, Inner/Outer Non-Cacheable (100% coherent with GPU/DMA & warm reset)
         //   Attr1 [15:8] = 0x00 → Device-nGnRnE (strongly ordered)
-        let mair: u64 = 0xFF;
+        let mair: u64 = 0x44;
         core::arch::asm!("msr mair_el1, {}", in(reg) mair);
 
         // TCR_EL1: Translation Control Register
         //   T0SZ  [5:0]   = 25  → 39-bit VA (512GB address space)
-        //   IRGN0 [9:8]   = 01  → Normal, WB RA WA (inner cacheability)
-        //   ORGN0 [11:10] = 01  → Normal, WB RA WA (outer cacheability)
+        //   IRGN0 [9:8]   = 00  → Normal, Inner Non-cacheable
+        //   ORGN0 [11:10] = 00  → Normal, Outer Non-cacheable
         //   SH0   [13:12] = 11  → Inner Shareable
         //   TG0   [15:14] = 00  → 4KB granule
         //   EPD1  [23]    = 1   → Disable TTBR1_EL1 walks
         //   IPS   [34:32] = 000 → 32-bit physical address (4GB)
         let tcr: u64 = 25
-            | (0b01 << 8)   // IRGN0
-            | (0b01 << 10)  // ORGN0
+            | (0b00 << 8)   // IRGN0
+            | (0b00 << 10)  // ORGN0
             | (0b11 << 12)  // SH0
             | (0b00 << 14)  // TG0
             | (1u64 << 23); // EPD1
@@ -131,12 +131,12 @@ pub fn init() {
             "isb",
         );
 
-        // ── Enable MMU + caches ──
+        // ── Enable MMU + instruction cache (data is Normal Non-Cacheable for GPU/DMA coherency) ──
         let mut sctlr: u64;
         core::arch::asm!("mrs {}, sctlr_el1", out(reg) sctlr);
-        sctlr |= (1 << 0)   // M — MMU enable
-               | (1 << 2)   // C — Data cache enable
-               | (1 << 12); // I — Instruction cache enable
+        sctlr &= !(1 << 2);  // Ensure C (Data cache) is off so stale warm-reboot lines never hit
+        sctlr |= (1 << 0)    // M — MMU enable
+               | (1 << 12);  // I — Instruction cache enable
         core::arch::asm!("msr sctlr_el1, {}", in(reg) sctlr);
         core::arch::asm!("isb");
     }

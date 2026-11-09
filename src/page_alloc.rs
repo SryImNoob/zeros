@@ -16,8 +16,11 @@ use core::ptr;
 /// Page size: 4 KB
 pub const PAGE_SIZE: usize = 4096;
 
-/// End of usable RAM (peripheral MMIO starts here)
-const RAM_END: usize = 0x3F00_0000;
+/// End of usable ARM RAM for page allocation: 256 MB (0x1000_0000).
+/// RPi Zero 2 W has 512MB total RAM (0x0000_0000 - 0x1FFF_FFFF) with the top
+/// 64-128MB reserved for VideoCore GPU. Using 0x3F00_0000 (1GB) on a 512MB
+/// Pi wraps around physical address bit 29 and overwrites the running kernel!
+const RAM_END: usize = 0x1000_0000;
 
 /// Free page list head (each free page stores a pointer to the next)
 static mut FREE_HEAD: *mut usize = ptr::null_mut();

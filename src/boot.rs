@@ -62,6 +62,9 @@ _start:
     mov     x1, #(1 << 31)     // HCR_EL2.RW = 1 (AArch64 at EL1)
     msr     hcr_el2, x1
 
+    // Do not trap FPU/SIMD accesses to EL2
+    msr     cptr_el2, xzr
+
     // Allow EL1 to access physical timer & counter
     mrs     x1, cnthctl_el2
     orr     x1, x1, #3         // EL1PCTEN=1, EL1PCEN=1
