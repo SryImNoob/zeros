@@ -1,18 +1,20 @@
-// ZerOS — Interactive GUI Launcher & System Apps (M7.1)
+// ZerOS — Interactive GUI Launcher & System Apps (M7.1 + M7.2 + M7.3)
 //
 // Provides a 4-tab graphical interface tailored for the Argon POD's
 // 320×240 RGB565 TFT display, 4 hardware buttons, NEC IR receiver, and
 // resistive touch screen:
 //
-//   Tab 0 [1:SYS]   — Live System Monitor (SoC Temp, ARM Clock, RAM bar, Task table)
-//   Tab 1 [2:FILES] — SD Card FAT32 File Browser & Text File Viewer
+//   Tab 0 [1:SYS]   — Live System Monitor + Preemptive Task Spawner (M7.2)
+//   Tab 1 [2:FILES] — VFS File Browser with Subdirectory Navigation & Streaming Preview (M7.3)
 //   Tab 2 [3:INPUT] — Hardware Button, NEC IR & Touch Screen Visualizer
-//   Tab 3 [4:LOG]   — Live Kernel Log Viewer
+//   Tab 3 [4:LOGS]  — Live Kernel Log Viewer
 //
 // Controls (4 Argon POD Bezel Buttons):
-//   - Button 1 (GPIO 16): Switch Tab (or Move Cursor Up in File Viewer)
+//   - Button 1 (GPIO 16): Next Tab (or Close File Preview)
 //   - Button 2 (GPIO 20): Move Cursor Down (in FILES) / Prev Tab
-//   - Button 3 (GPIO 21): Action / Open File Preview / Refresh
+//   - Button 3 (GPIO 21):
+//       * In [1:SYS]   -> Spawn CPU-bound preemptive worker task (`cpu_work`)
+//       * In [2:FILES] -> Enter `<DIR>` subdirectory OR stream-preview file via VFS FD
 //   - Button 4 (GPIO 26): Reboot back to Raspberry Pi OS immediately
 
 #![allow(dead_code)]
@@ -26,6 +28,7 @@ use crate::drivers::display::{self, colors, Color};
 use crate::drivers::input::{self, touch, InputEvent};
 use crate::drivers::mailbox;
 use crate::fs::fat32::{self, DirEntry};
+use crate::fs::vfs::{self, OpenMode};
 use crate::kernel::{console, task, tryboot};
 use crate::mm::page_alloc;
 
@@ -68,11 +71,46 @@ impl Tab {
     }
 }
 
+/// Pure CPU-bound worker task spawned by pressing Button 3 in `1:SYS`.
+/// Intentionally does NOT call `yield_now()` or `sleep_ms()` inside its prime
+/// computation loop so that hardware time-slice preemption (`preempt_from_irq`)
+/// preempts it every 50ms! Once finished, its 16KB stack is automatically reaped.
+fn preemptive_cpu_worker() {
+    crate::println!("[WORK] cpu_work started (pure CPU loop, testing preemption)...");
+    let start_tick = timer::ticks();
+    let mut primes_found = 0u32;
+    let mut candidate = 2u32;
+
+    // Run pure CPU prime search for ~250 ticks (2.5 seconds) without yielding
+    while timer::ticks().saturating_sub(start_tick) < 250 {
+        let mut is_prime = true;
+        let mut d = 2u32;
+        while d * d <= candidate {
+            if candidate % d == 0 {
+                is_prime = false;
+                break;
+            }
+            d += 1;
+        }
+        if is_prime {
+            primes_found += 1;
+        }
+        candidate += 1;
+        core::hint::black_box(primes_found);
+    }
+
+    crate::println!(
+        "[WORK] cpu_work done! Found {} primes (auto-reaping 16KB stack)",
+        primes_found
+    );
+}
+
 pub struct UiState {
     tab: Tab,
     needs_full_redraw: bool,
     needs_content_update: bool,
-    // Files tab state
+    // Files tab state (M7.3 VFS + Subdirectory support)
+    dir_stack: Vec<(u32, String)>, // Stack of (dir_cluster, dir_name)
     files: Vec<DirEntry>,
     file_cursor: usize,
     viewing_file: bool,
@@ -88,7 +126,7 @@ pub struct UiState {
 impl UiState {
     pub fn new() -> Self {
         let files = if fat32::is_mounted() {
-            fat32::list_root()
+            fat32::list_dir(0)
         } else {
             Vec::new()
         };
@@ -97,6 +135,7 @@ impl UiState {
             tab: Tab::SysMon,
             needs_full_redraw: true,
             needs_content_update: true,
+            dir_stack: Vec::new(),
             files,
             file_cursor: 0,
             viewing_file: false,
@@ -106,6 +145,23 @@ impl UiState {
             last_ir_code: None,
             last_touch: None,
             event_count: 0,
+        }
+    }
+
+    fn current_dir_cluster(&self) -> u32 {
+        self.dir_stack.last().map(|(c, _)| *c).unwrap_or(0)
+    }
+
+    fn current_path_display(&self) -> String {
+        if self.dir_stack.is_empty() {
+            String::from("/")
+        } else {
+            let mut s = String::from("/");
+            for (_, name) in &self.dir_stack {
+                s.push_str(name);
+                s.push('/');
+            }
+            s
         }
     }
 
@@ -126,7 +182,7 @@ impl UiState {
                         self.needs_full_redraw = true;
                     }
                     1 => {
-                        // Button 2 (GPIO 20): In FILES tab -> move cursor down; otherwise next tab
+                        // Button 2 (GPIO 20): In FILES tab -> move cursor down; otherwise prev tab
                         if self.tab == Tab::Files && !self.viewing_file && !self.files.is_empty() {
                             self.file_cursor = (self.file_cursor + 1) % self.files.len();
                             self.needs_content_update = true;
@@ -139,16 +195,24 @@ impl UiState {
                         }
                     }
                     2 => {
-                        // Button 3 (GPIO 21): Action / Open file preview in FILES
-                        if self.tab == Tab::Files {
-                            if self.viewing_file {
-                                self.viewing_file = false;
-                            } else {
-                                self.open_selected_file();
+                        // Button 3 (GPIO 21): Context Action!
+                        match self.tab {
+                            Tab::SysMon => {
+                                // Spawn a CPU-bound worker task to demonstrate M7.2 preemption & stack reaping
+                                let _ = task::spawn("cpu_work", preemptive_cpu_worker);
+                                self.needs_content_update = true;
                             }
-                            self.needs_full_redraw = true;
-                        } else {
-                            self.needs_content_update = true;
+                            Tab::Files => {
+                                if self.viewing_file {
+                                    self.viewing_file = false;
+                                } else {
+                                    self.activate_selected_entry();
+                                }
+                                self.needs_full_redraw = true;
+                            }
+                            _ => {
+                                self.needs_content_update = true;
+                            }
                         }
                     }
                     3 => {
@@ -181,7 +245,6 @@ impl UiState {
             }
             InputEvent::Touch(x, y) => {
                 self.last_touch = Some((x, y));
-                // Tapping the tab bar (y = 8..28) switches tabs directly!
                 if (8..28).contains(&y) {
                     let new_tab = match x / 80 {
                         0 => Tab::SysMon,
@@ -203,41 +266,85 @@ impl UiState {
         }
     }
 
-    fn open_selected_file(&mut self) {
+    /// In `2:FILES`, either enter a subdirectory (`<DIR>`) or stream-preview a file via VFS FD.
+    fn activate_selected_entry(&mut self) {
         if self.files.is_empty() {
             return;
         }
-        let entry = &self.files[self.file_cursor];
-        self.file_preview_name = entry.name.clone();
-        self.file_preview_lines.clear();
+        let entry = self.files[self.file_cursor].clone();
 
-        if entry.size > 64 * 1024 {
-            let mut msg = String::new();
-            let _ = write!(msg, "(Binary/Large file: {} bytes)", entry.size);
-            self.file_preview_lines.push(msg);
-            self.viewing_file = true;
+        if entry.is_dir {
+            if entry.name == ".." {
+                self.dir_stack.pop();
+            } else {
+                self.dir_stack.push((entry.first_cluster, entry.name));
+            }
+            let cluster = self.current_dir_cluster();
+            self.files = fat32::list_dir(cluster);
+            self.file_cursor = 0;
             return;
         }
 
-        if let Some(bytes) = fat32::read_file(&entry.name) {
-            for line_bytes in bytes.split(|&b| b == b'\n').take(12) {
-                let mut s = String::new();
-                for &b in line_bytes.iter().take(36) {
-                    if b == b'\r' {
-                        continue;
+        // Open file via M7.3 VFS File Descriptor Table and stream up to 384 bytes
+        self.file_preview_name = entry.name.clone();
+        self.file_preview_lines.clear();
+
+        if let Some(fd) = vfs::open_entry(entry.clone(), OpenMode::ReadOnly) {
+            let mut buf = [0u8; 384];
+            let n = vfs::read(fd, &mut buf).unwrap_or(0);
+            vfs::close(fd);
+
+            let slice = &buf[..n];
+            // Check if content is mostly printable ASCII text or binary
+            let non_text = slice
+                .iter()
+                .filter(|&&b| b != b'\n' && b != b'\r' && b != b'\t' && !(0x20..=0x7E).contains(&b))
+                .count();
+
+            if non_text * 5 > slice.len().max(1) {
+                // Binary file: render Hex + ASCII dump lines
+                for chunk in slice.chunks(8).take(12) {
+                    let mut line = String::with_capacity(36);
+                    for &b in chunk {
+                        let _ = write!(line, "{:02X} ", b);
                     }
-                    let ch = if (0x20..=0x7E).contains(&b) {
-                        b as char
-                    } else {
-                        '.'
-                    };
-                    s.push(ch);
+                    while line.len() < 25 {
+                        line.push(' ');
+                    }
+                    line.push('|');
+                    for &b in chunk {
+                        let ch = if (0x20..=0x7E).contains(&b) {
+                            b as char
+                        } else {
+                            '.'
+                        };
+                        line.push(ch);
+                    }
+                    self.file_preview_lines.push(line);
                 }
-                self.file_preview_lines.push(s);
+            } else {
+                // Text file: render lines
+                for line_bytes in slice.split(|&b| b == b'\n').take(12) {
+                    let mut s = String::new();
+                    for &b in line_bytes.iter().take(36) {
+                        if b == b'\r' {
+                            continue;
+                        }
+                        let ch = if (0x20..=0x7E).contains(&b) {
+                            b as char
+                        } else {
+                            ' '
+                        };
+                        s.push(ch);
+                    }
+                    self.file_preview_lines.push(s);
+                }
             }
         } else {
-            self.file_preview_lines.push(String::from("(Failed to read cluster chain)"));
+            self.file_preview_lines
+                .push(String::from("(VFS failed to open file)"));
         }
+
         self.viewing_file = true;
     }
 
@@ -269,10 +376,8 @@ impl UiState {
 
     /// Draw the tab bar (`y = 8..28`), main card frame (`y = 32..220`), and footer (`y = 224..240`).
     fn draw_chrome(&self) {
-        // Clear workspace between top status bar (y=0..8) and bottom (y=240)
         display::fill_rect(0, 8, 320, 232, COL_BG);
 
-        // 4 Tabs across y = 8..28
         let tabs = [
             (Tab::SysMon, " 1:SYS    "),
             (Tab::Files, " 2:FILES  "),
@@ -291,28 +396,28 @@ impl UiState {
             }
         }
 
-        // Main Card Frame (x=6..314, y=32..220)
         display::fill_rect(6, 32, 308, 188, COL_CARD_BG);
         display::draw_rect_border(6, 32, 308, 188, 1, COL_CARD_BORDER);
 
-        // Footer bar (y = 224..240)
         display::fill_rect(0, 224, 320, 16, COL_FOOTER_BG);
         let footer = match self.tab {
-            Tab::Files if !self.viewing_file => " B1:Tab  B2:Down  B3:Open  B4:RPiOS   ",
-            Tab::Files => " B1/B2/B3:Close Preview    B4:RPiOS   ",
+            Tab::SysMon => " B1:Tab B2:Prev B3:+Task  B4:RPiOS    ",
+            Tab::Files if !self.viewing_file => " B1:Tab B2:Down B3:Open/CD B4:RPiOS   ",
+            Tab::Files => " B1/B2/B3:Close Preview   B4:RPiOS    ",
             _ => " B1:NextTab B2:Prev B3:Ref B4:RPiOS   ",
         };
         display::draw_str(4, 228, footer, COL_ACCENT, COL_FOOTER_BG);
     }
 
     fn draw_sysmon_content(&self) {
-        display:: draw_str(
-            14,
-            40,
-            "HARDWARE & KERNEL TELEMETRY",
-            COL_ACCENT,
-            COL_CARD_BG,
+        let mut hdr = String::with_capacity(38);
+        let _ = write!(
+            hdr,
+            "PREEMPTIVE OS | Pre:{:<3} Reap:{:<2} ",
+            task::preemptions_count(),
+            task::reaped_count()
         );
+        display::draw_str(14, 40, &hdr, COL_ACCENT, COL_CARD_BG);
         display::fill_rect(14, 50, 292, 1, COL_CARD_BORDER);
 
         // 1. SoC Temperature + ARM Clock
@@ -364,11 +469,11 @@ impl UiState {
             COL_CARD_BORDER,
         );
 
-        // 3. Multitasking Scheduler Table
+        // 3. Preemptive Multitasking Scheduler Table
         display::draw_str(
             14,
             118,
-            "PID NAME       STATE    TICKS   SW  ",
+            "PID NAME       STATE    TICKS   PRE ",
             COL_ACCENT,
             COL_CARD_BG,
         );
@@ -383,24 +488,41 @@ impl UiState {
                 task::TaskState::Running => "RUN  ",
                 task::TaskState::Ready => "READY",
                 task::TaskState::Sleeping(_) => "SLEEP",
-                task::TaskState::Finished => "DONE ",
+                task::TaskState::Finished => "ZOMBI",
                 task::TaskState::Unused => "FREE ",
             };
             let mut tline = String::with_capacity(40);
             let _ = write!(
                 tline,
                 " #{:<1} {:<10} {:<6} {:>7} {:>4}  ",
-                t.id, t.name, st, t.ticks_run, t.switches
+                t.id, t.name, st, t.ticks_run, t.preemptions
             );
             display::draw_str(14, row_y, &tline, colors::WHITE, COL_CARD_BG);
             row_y += 12;
         });
+
+        // Clear any leftover task rows when a spawned worker task gets reaped
+        while row_y + 8 <= 214 {
+            display::draw_str(
+                14,
+                row_y,
+                "                                    ",
+                colors::WHITE,
+                COL_CARD_BG,
+            );
+            row_y += 12;
+        }
     }
 
     fn draw_files_content(&self) {
         if self.viewing_file {
             let mut title = String::with_capacity(38);
-            let _ = write!(title, "FILE: {:<28}", self.file_preview_name);
+            let _ = write!(
+                title,
+                "VFS FD: {:<18} (Ops:{})",
+                self.file_preview_name,
+                vfs::total_ops()
+            );
             display::draw_str(14, 40, &title, colors::YELLOW, COL_CARD_BG);
             display::fill_rect(14, 50, 292, 1, COL_CARD_BORDER);
 
@@ -418,10 +540,12 @@ impl UiState {
             return;
         }
 
+        let path_str = self.current_path_display();
         let mut hdr = String::with_capacity(38);
         let _ = write!(
             hdr,
-            "FAT32 /boot/firmware ({} files)",
+            "VFS {:<18} ({:>2} items) ",
+            path_str,
             self.files.len()
         );
         display::draw_str(14, 40, &hdr, COL_ACCENT, COL_CARD_BG);
@@ -431,7 +555,7 @@ impl UiState {
             display::draw_str(
                 14,
                 70,
-                "No FAT32 volume mounted.",
+                "Empty directory or unmounted.",
                 COL_TEXT_DIM,
                 COL_CARD_BG,
             );
@@ -454,16 +578,26 @@ impl UiState {
                 let bg = if selected { COL_SEL_BG } else { COL_CARD_BG };
                 let fg = if selected {
                     colors::YELLOW
+                } else if entry.is_dir {
+                    colors::CYAN
                 } else {
                     colors::WHITE
                 };
                 let prefix = if selected { ">" } else { " " };
                 let mut line = String::with_capacity(38);
-                let _ = write!(
-                    line,
-                    "{} {:<15} {:>9} B  c:{:<4}",
-                    prefix, entry.name, entry.size, entry.first_cluster
-                );
+                if entry.is_dir {
+                    let _ = write!(
+                        line,
+                        "{} [{:<13}]     <DIR>   c:{:<4}",
+                        prefix, entry.name, entry.first_cluster
+                    );
+                } else {
+                    let _ = write!(
+                        line,
+                        "{} {:<15} {:>9} B  c:{:<4}",
+                        prefix, entry.name, entry.size, entry.first_cluster
+                    );
+                }
                 display::draw_str(12, y, &line, fg, bg);
             } else {
                 display::draw_str(
@@ -487,7 +621,6 @@ impl UiState {
         );
         display::fill_rect(14, 50, 292, 1, COL_CARD_BORDER);
 
-        // 4 Bezel Button Boxes
         let btn_mask = input::button_state();
         let pins = [16u32, 20, 21, 26];
         for i in 0..4usize {
@@ -508,7 +641,6 @@ impl UiState {
             display::draw_str(x + 4, y + 22, &lbl, box_fg, box_bg);
         }
 
-        // Last Button & Event count
         let mut line = String::with_capacity(38);
         match self.last_btn_pressed {
             Some(b) => {
@@ -529,7 +661,6 @@ impl UiState {
         }
         display::draw_str(14, 112, &line, colors::WHITE, COL_CARD_BG);
 
-        // NEC IR Receiver Status
         line.clear();
         match self.last_ir_code {
             Some(code) => {
@@ -547,7 +678,6 @@ impl UiState {
         }
         display::draw_str(14, 134, &line, colors::CYAN, COL_CARD_BG);
 
-        // Resistive Touch Screen Status
         line.clear();
         match self.last_touch {
             Some((tx, ty)) => {
@@ -563,7 +693,6 @@ impl UiState {
         }
         display::draw_str(14, 156, &line, colors::YELLOW, COL_CARD_BG);
 
-        // Timer Counter status
         line.clear();
         let _ = write!(
             line,
@@ -599,8 +728,6 @@ impl UiState {
 
 /// Interactive UI & Input Task — runs at 25Hz (every 40ms), polling buttons, IR, and Touch.
 pub fn ui_task() {
-    // Let the boot console display for 1.5 seconds so the user can see boot messages,
-    // then transition smoothly into the M7.1 Interactive Card Desktop!
     task::sleep_ms(1500);
 
     console::set_gui_mode(true);
@@ -615,7 +742,6 @@ pub fn ui_task() {
             had_event = true;
         }
 
-        // Poll resistive touch screen on SPI0 CE1 (every 40ms in task context)
         if let Some((tx, ty)) = touch::poll_touch() {
             ui.handle_event(InputEvent::Touch(tx, ty));
             had_event = true;
@@ -623,7 +749,6 @@ pub fn ui_task() {
 
         tick_div += 1;
         if tick_div >= 25 {
-            // 1Hz periodic telemetry refresh
             tick_div = 0;
             ui.on_periodic_tick();
         }

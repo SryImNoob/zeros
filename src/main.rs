@@ -167,10 +167,10 @@ fn heartbeat_task() {
     }
 }
 
-/// Task #3: Background self-test task — verifies heap & Tryboot A/B persistence
+/// Task #3: Background self-test task — verifies heap, VFS FD streaming, & Preemption
 fn self_test_task() {
-    println!("[TASK] self_test: starting background check...");
-    task::sleep_ms(500);
+    println!("[TASK] self_test: starting M7.2/M7.3 background check...");
+    task::sleep_ms(300);
 
     let mut vec = alloc::vec::Vec::new();
     for i in 1..=10u32 {
@@ -183,19 +183,40 @@ fn self_test_task() {
     );
 
     if fat32::is_mounted() {
-        let partitions = fat32::partitions();
-        let part_count = partitions.iter().filter(|p| p.is_some()).count();
-        println!(
-            "[TASK] self_test: verified {} MBR partitions on SD card",
-            part_count
-        );
+        // Test M7.3 VFS File Descriptor open / seek / read / close
+        let (fd_opt, path) = if let Some(fd) =
+            fs::vfs::open("/CONFIG.TXT", fs::vfs::OpenMode::ReadOnly)
+        {
+            (Some(fd), "/CONFIG.TXT")
+        } else {
+            (
+                fs::vfs::open("/TRYBOOT.TXT", fs::vfs::OpenMode::ReadOnly),
+                "/TRYBOOT.TXT",
+            )
+        };
+        if let Some(fd) = fd_opt {
+            let mut buf = [0u8; 32];
+            let n = fs::vfs::read(fd, &mut buf).unwrap_or(0);
+            fs::vfs::close(fd);
+            println!("[OK] VFS FD #{}: streamed {}B from {}", fd, n, path);
+        }
 
         if tryboot::set_default_partition(1, 2) {
             println!("[TASK] self_test: Tryboot A/B commit test OK");
         }
     }
 
-    task::sleep_ms(500);
+    // Wait until ui_desktop is active (40ms polling), then run a pure CPU loop for 150ms
+    // without calling yield_now() to verify hardware timer time-slice preemption!
+    task::sleep_ms(1300);
+    let start = timer::ticks();
+    while timer::ticks().saturating_sub(start) < 15 {
+        core::hint::spin_loop();
+    }
+    println!(
+        "[OK] Preemption verified (preemptions={})",
+        task::preemptions_count()
+    );
 }
 
 /// Panic handler

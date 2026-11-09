@@ -227,15 +227,33 @@ impl Fat32Volume {
     }
 }
 
+/// Get the root directory cluster number (usually 2).
+pub fn root_cluster() -> u32 {
+    match unsafe { &*core::ptr::addr_of!(VOLUME) } {
+        Some(v) => v.root_cluster,
+        None => 2,
+    }
+}
+
 /// List all files and subdirectories in the root directory.
 pub fn list_root() -> Vec<DirEntry> {
+    list_dir(0)
+}
+
+/// List all files and subdirectories in the directory starting at `dir_cluster`
+/// (`0` means the root directory).
+pub fn list_dir(dir_cluster: u32) -> Vec<DirEntry> {
     let mut entries = Vec::new();
     let vol = match unsafe { &*core::ptr::addr_of!(VOLUME) } {
         Some(v) => v,
         None => return entries,
     };
 
-    let mut cluster = vol.root_cluster;
+    let mut cluster = if dir_cluster < 2 {
+        vol.root_cluster
+    } else {
+        dir_cluster
+    };
     let mut sector_buf = [0u8; SECTOR_SIZE];
 
     loop {
@@ -269,6 +287,9 @@ pub fn list_root() -> Vec<DirEntry> {
 
                 let is_dir = (attr & 0x10) != 0;
                 let name = format_short_name(&entry[0..11]);
+                if name == "." {
+                    continue; // Skip self-reference entry
+                }
                 let cluster_hi = u16::from_le_bytes([entry[20], entry[21]]) as u32;
                 let cluster_lo = u16::from_le_bytes([entry[26], entry[27]]) as u32;
                 let first_cluster = (cluster_hi << 16) | cluster_lo;
@@ -294,39 +315,89 @@ pub fn list_root() -> Vec<DirEntry> {
     entries
 }
 
-/// Read the entire contents of a file in the root directory (case-insensitive).
-pub fn read_file(filename: &str) -> Option<Vec<u8>> {
-    let vol = unsafe { (&*core::ptr::addr_of!(VOLUME)).as_ref()? };
-    let entries = list_root();
-
-    let target = entries
-        .iter()
-        .find(|e| !e.is_dir && eq_ignore_ascii_case(&e.name, filename))?;
-
-    let mut data = Vec::with_capacity(target.size as usize);
-    if target.size == 0 || target.first_cluster < 2 {
-        return Some(data);
+/// Resolve a path like `"/CONFIG.TXT"`, `"VERSION.TXT"`, or `"/OVERLAYS/TFT9341.DTBO"`
+/// into its `DirEntry`.
+pub fn resolve_path(path: &str) -> Option<DirEntry> {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return None;
     }
 
-    let mut cluster = target.first_cluster;
-    let mut remaining = target.size as usize;
-    let mut sector_buf = [0u8; SECTOR_SIZE];
+    let mut cur_cluster = 0u32;
+    let mut parts = trimmed.split('/').peekable();
 
-    loop {
-        let base_lba = vol.cluster_to_lba(cluster);
-        for s in 0..(vol.sectors_per_cluster as u32) {
-            if remaining == 0 {
-                break;
-            }
-            if !sd::read_sector(base_lba + s, &mut sector_buf) {
+    while let Some(part) = parts.next() {
+        if part.is_empty() {
+            continue;
+        }
+        let entries = list_dir(cur_cluster);
+        let found = entries
+            .into_iter()
+            .find(|e| eq_ignore_ascii_case(&e.name, part))?;
+
+        if parts.peek().is_some() {
+            if !found.is_dir {
                 return None;
             }
-            let to_copy = remaining.min(SECTOR_SIZE);
-            data.extend_from_slice(&sector_buf[..to_copy]);
-            remaining -= to_copy;
+            cur_cluster = found.first_cluster;
+        } else {
+            return Some(found);
+        }
+    }
+
+    None
+}
+
+/// Read up to `buf.len()` bytes from `entry` starting at `offset` (streamed without loading whole file).
+pub fn read_entry_range(entry: &DirEntry, offset: usize, buf: &mut [u8]) -> usize {
+    if entry.is_dir || offset >= entry.size as usize || buf.is_empty() || entry.first_cluster < 2 {
+        return 0;
+    }
+
+    let vol = match unsafe { &*core::ptr::addr_of!(VOLUME) } {
+        Some(v) => v,
+        None => return 0,
+    };
+
+    let spc = vol.sectors_per_cluster as usize;
+    let cluster_bytes = spc * SECTOR_SIZE;
+    let max_avail = (entry.size as usize) - offset;
+    let to_read = buf.len().min(max_avail);
+
+    // Advance to the starting cluster
+    let skip_clusters = offset / cluster_bytes;
+    let mut cluster = entry.first_cluster;
+    for _ in 0..skip_clusters {
+        match vol.next_cluster(cluster) {
+            Some(next) => cluster = next,
+            None => return 0,
+        }
+    }
+
+    let mut cluster_off = offset % cluster_bytes;
+    let mut copied = 0usize;
+    let mut sector_buf = [0u8; SECTOR_SIZE];
+
+    while copied < to_read {
+        let base_lba = vol.cluster_to_lba(cluster);
+        let start_s = cluster_off / SECTOR_SIZE;
+        let mut sec_off = cluster_off % SECTOR_SIZE;
+
+        for s in start_s..spc {
+            if copied >= to_read {
+                break;
+            }
+            if !sd::read_sector(base_lba + (s as u32), &mut sector_buf) {
+                return copied;
+            }
+            let chunk = (SECTOR_SIZE - sec_off).min(to_read - copied);
+            buf[copied..copied + chunk].copy_from_slice(&sector_buf[sec_off..sec_off + chunk]);
+            copied += chunk;
+            sec_off = 0;
         }
 
-        if remaining == 0 {
+        cluster_off = 0;
+        if copied >= to_read {
             break;
         }
 
@@ -336,13 +407,25 @@ pub fn read_file(filename: &str) -> Option<Vec<u8>> {
         }
     }
 
+    copied
+}
+
+/// Read the entire contents of a file by name or path (e.g. `"VERSION.TXT"` or `"/OVERLAYS/README"`).
+pub fn read_file(path: &str) -> Option<Vec<u8>> {
+    let target = resolve_path(path)?;
+    if target.is_dir {
+        return None;
+    }
+
+    let mut data = alloc::vec![0u8; target.size as usize];
+    let n = read_entry_range(&target, 0, &mut data);
+    data.truncate(n);
     Some(data)
 }
 
-/// Update an existing small file (<= 1 sector / 512 bytes) in the root directory.
-/// Used by Tryboot A/B to update `AUTOBOOT.TXT` on the boot partition.
-pub fn write_small_file(filename: &str, new_data: &[u8]) -> bool {
-    if new_data.len() > SECTOR_SIZE {
+/// Update an existing small file (<= 512 bytes) given its `DirEntry`.
+pub fn write_entry_small(target: &mut DirEntry, new_data: &[u8]) -> bool {
+    if new_data.len() > SECTOR_SIZE || target.is_dir || target.first_cluster < 2 {
         return false;
     }
 
@@ -351,20 +434,6 @@ pub fn write_small_file(filename: &str, new_data: &[u8]) -> bool {
         None => return false,
     };
 
-    let entries = list_root();
-    let target = match entries
-        .iter()
-        .find(|e| !e.is_dir && eq_ignore_ascii_case(&e.name, filename))
-    {
-        Some(t) => t,
-        None => return false,
-    };
-
-    if target.first_cluster < 2 {
-        return false;
-    }
-
-    // 1. Write new content to the first sector of the file's first cluster
     let data_lba = vol.cluster_to_lba(target.first_cluster);
     let mut sector_buf = [0u8; SECTOR_SIZE];
     sector_buf[..new_data.len()].copy_from_slice(new_data);
@@ -372,17 +441,32 @@ pub fn write_small_file(filename: &str, new_data: &[u8]) -> bool {
         return false;
     }
 
-    // 2. Update file size in the directory entry
     let mut dir_buf = [0u8; SECTOR_SIZE];
     if !sd::read_sector(target.dir_sector, &mut dir_buf) {
         return false;
     }
 
-    let size_bytes = (new_data.len() as u32).to_le_bytes();
+    let new_size = new_data.len() as u32;
+    let size_bytes = new_size.to_le_bytes();
     let off = target.dir_offset + 28;
     dir_buf[off..off + 4].copy_from_slice(&size_bytes);
 
-    sd::write_sector(target.dir_sector, &dir_buf)
+    if sd::write_sector(target.dir_sector, &dir_buf) {
+        target.size = new_size;
+        true
+    } else {
+        false
+    }
+}
+
+/// Update an existing small file (<= 1 sector / 512 bytes) by path or filename.
+/// Used by Tryboot A/B to update `AUTOBOOT.TXT` on the boot partition.
+pub fn write_small_file(filename: &str, new_data: &[u8]) -> bool {
+    if let Some(mut entry) = resolve_path(filename) {
+        write_entry_small(&mut entry, new_data)
+    } else {
+        false
+    }
 }
 
 // ─── String formatting helpers ───

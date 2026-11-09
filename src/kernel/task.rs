@@ -1,13 +1,14 @@
-// ZerOS — Multitasking & Task Scheduler (M6.1)
+// ZerOS — Preemptive Multitasking & Task Lifecycle Manager (M6.1 + M7.2)
 //
-// Implements a round-robin kernel task scheduler for AArch64 with:
+// Implements a preemptive round-robin kernel task scheduler for AArch64 with:
 //   - Hardware context switching (__switch_context in assembly: x19-x30, sp)
-//   - Per-task 16KB stacks allocated from the physical page allocator
-//   - Cooperative yielding (yield_now) and timer-driven sleep (sleep_ms)
-//   - CPU time accounting (ticks_run per task)
-//
-// Task 0 is always the boot/idle task, which remains Ready and executes WFE
-// when all other tasks are sleeping.
+//   - Time-slice preemption (`TIME_SLICE_TICKS = 5` = 50ms) directly from Timer IRQ
+//   - Cooperative yielding (`yield_now`) and timer-driven sleep (`sleep_ms`)
+//   - Full task lifecycle: `spawn`, `kill(pid)`, and automatic stack page reaping
+//     (`reap_zombies_locked`) that returns 16KB stacks to `page_alloc` upon exit
+//   - CPU time & preemption accounting (`ticks_run`, `switches`, `preemptions`)
+
+#![allow(dead_code)]
 
 use core::arch::global_asm;
 use crate::arch::timer;
@@ -19,6 +20,9 @@ pub const MAX_TASKS: usize = 16;
 
 /// Stack size per task in pages (4 pages = 16 KB)
 const STACK_PAGES: usize = 4;
+
+/// Time slice per task in 100Hz timer ticks (5 ticks = 50ms)
+pub const TIME_SLICE_TICKS: u64 = 5;
 
 /// Saved CPU callee-saved registers for context switching (AAPCS64)
 #[repr(C)]
@@ -46,7 +50,7 @@ pub enum TaskState {
     Ready,
     Running,
     Sleeping(u64), // Wake-up tick number
-    Finished,
+    Finished,      // Waiting to be reaped once CPU switches off its stack
 }
 
 /// Task Control Block (TCB)
@@ -60,7 +64,9 @@ pub struct Task {
     pub stack_base: usize,
     pub stack_size: usize,
     pub ticks_run: u64,
+    pub slice_ticks: u64,
     pub switches: u64,
+    pub preemptions: u64,
 }
 
 impl Task {
@@ -79,7 +85,9 @@ impl Task {
             stack_base: 0,
             stack_size: 0,
             ticks_run: 0,
+            slice_ticks: 0,
             switches: 0,
+            preemptions: 0,
         }
     }
 }
@@ -124,6 +132,12 @@ static mut CURRENT_TASK: usize = 0;
 /// Whether the scheduler has been initialized
 static mut INITIALIZED: bool = false;
 
+/// Total number of tasks reaped (stacks freed back to `page_alloc`)
+static mut TOTAL_REAPED: u64 = 0;
+
+/// Total number of involuntary time-slice preemptions across the system
+static mut TOTAL_PREEMPTIONS: u64 = 0;
+
 /// Initialize the task scheduler.
 /// Registers the current execution flow as Task 0 ("idle").
 pub fn init() {
@@ -137,19 +151,23 @@ pub fn init() {
             stack_base: 0, // Uses boot stack (0x00000000 - 0x00080000)
             stack_size: 0x80000,
             ticks_run: 0,
+            slice_ticks: 0,
             switches: 1,
+            preemptions: 0,
         };
         CURRENT_TASK = 0;
         INITIALIZED = true;
     });
 
-    crate::println!("[OK] Scheduler: initialized (max {} tasks, {}KB stack/task)",
-        MAX_TASKS, STACK_PAGES * PAGE_SIZE / 1024);
+    crate::println!(
+        "[OK] Scheduler: preemptive RR (max {} tasks, {}KB stack, {}ms slice)",
+        MAX_TASKS,
+        STACK_PAGES * PAGE_SIZE / 1024,
+        TIME_SLICE_TICKS * 10
+    );
 }
 
 /// Allocate a contiguous multi-page stack from the page allocator.
-/// Note: page_alloc is LIFO (descending addresses), so allocating N pages
-/// sequentially yields pages in descending order: first page is highest address.
 fn alloc_stack(pages: usize) -> Option<(usize, usize)> {
     let mut highest = 0usize;
     let mut lowest = 0usize;
@@ -170,18 +188,53 @@ fn alloc_stack(pages: usize) -> Option<(usize, usize)> {
     }
 
     let size = pages * PAGE_SIZE;
-    // Verify contiguity
     if highest - lowest + PAGE_SIZE == size {
         Some((lowest, lowest + size))
     } else {
-        // Fallback: use at least the single page at `highest`
         Some((highest, highest + PAGE_SIZE))
+    }
+}
+
+/// Free all physical pages belonging to a task's stack back to `page_alloc`.
+unsafe fn free_task_stack(stack_base: usize, stack_size: usize) {
+    if stack_base == 0 || stack_size == 0 {
+        return;
+    }
+    let mut addr = stack_base;
+    let end = stack_base + stack_size;
+    while addr < end {
+        page_alloc::free_page(addr);
+        addr += PAGE_SIZE;
+    }
+}
+
+/// Reap any `Finished` tasks that are no longer the currently executing task.
+/// Frees their physical stack pages and marks their TCB slot `Unused`.
+/// MUST be called with interrupts disabled.
+unsafe fn reap_zombies_locked() {
+    let cur = CURRENT_TASK;
+    for i in 1..MAX_TASKS {
+        if i != cur && TASKS[i].state == TaskState::Finished {
+            let base = TASKS[i].stack_base;
+            let size = TASKS[i].stack_size;
+            let name = TASKS[i].name;
+            free_task_stack(base, size);
+            TASKS[i] = Task::empty();
+            TOTAL_REAPED += 1;
+            crate::println!(
+                "[TASK] Reaped task #{} '{}' -> freed {}KB stack at 0x{:08x}",
+                i,
+                name,
+                size / 1024,
+                base
+            );
+        }
     }
 }
 
 /// Trampoline function where all newly spawned tasks begin execution.
 extern "C" fn task_entry_trampoline() -> ! {
-    // Re-enable IRQs because __switch_context was called inside without_interrupts
+    // Re-enable IRQs because __switch_context was called inside without_interrupts / IRQ
     interrupts::enable();
 
     // Retrieve entry function for the current task
@@ -194,7 +247,7 @@ extern "C" fn task_entry_trampoline() -> ! {
         func();
     }
 
-    // If the task function returns, mark task as Finished and yield forever
+    // If the task function returns, mark task as Finished and yield so another task reaps us
     interrupts::without_interrupts(|| unsafe {
         let cur = CURRENT_TASK;
         TASKS[cur].state = TaskState::Finished;
@@ -210,7 +263,8 @@ extern "C" fn task_entry_trampoline() -> ! {
 /// Returns `Some(task_id)` on success, or `None` if the task table is full or out of memory.
 pub fn spawn(name: &'static str, entry: fn()) -> Option<usize> {
     interrupts::without_interrupts(|| unsafe {
-        // Find a free slot (or reuse a Finished slot)
+        reap_zombies_locked();
+
         let mut slot = None;
         for i in 1..MAX_TASKS {
             if TASKS[i].state == TaskState::Unused {
@@ -220,9 +274,7 @@ pub fn spawn(name: &'static str, entry: fn()) -> Option<usize> {
         }
         let id = slot?;
 
-        // Allocate stack
         let (stack_base, stack_top) = alloc_stack(STACK_PAGES)?;
-        // Keep stack 16-byte aligned at top
         let aligned_sp = stack_top & !0xF;
 
         let mut ctx = TaskContext::default();
@@ -238,13 +290,43 @@ pub fn spawn(name: &'static str, entry: fn()) -> Option<usize> {
             stack_base,
             stack_size: stack_top - stack_base,
             ticks_run: 0,
+            slice_ticks: 0,
             switches: 0,
+            preemptions: 0,
         };
 
-        crate::println!("[OK] Task spawned: #{} '{}' (stack 0x{:08x}-0x{:08x})",
-            id, name, stack_base, stack_top);
+        crate::println!(
+            "[OK] Task spawned: #{} '{}' (stack 0x{:08x}-0x{:08x})",
+            id,
+            name,
+            stack_base,
+            stack_top
+        );
 
         Some(id)
+    })
+}
+
+/// Terminate a task by PID (`pid >= 1`).
+/// Frees its stack pages immediately if it is not the currently running task,
+/// or marks it `Finished` and schedules away if it is the current task.
+pub fn kill(pid: usize) -> bool {
+    if pid == 0 || pid >= MAX_TASKS {
+        return false; // Cannot kill Task 0 (idle)
+    }
+
+    interrupts::without_interrupts(|| unsafe {
+        if TASKS[pid].state == TaskState::Unused || TASKS[pid].state == TaskState::Finished {
+            return false;
+        }
+        crate::println!("[TASK] Killing task #{} '{}'...", pid, TASKS[pid].name);
+        TASKS[pid].state = TaskState::Finished;
+        if pid == CURRENT_TASK {
+            schedule_locked();
+        } else {
+            reap_zombies_locked();
+        }
+        true
     })
 }
 
@@ -259,7 +341,6 @@ pub fn yield_now() {
 }
 
 /// Put the current task to sleep for `ms` milliseconds.
-/// (At 100Hz timer, 1 tick = 10ms; minimum sleep is 1 tick.)
 pub fn sleep_ms(ms: u64) {
     let ticks = ((ms + 9) / 10).max(1);
     sleep_ticks(ticks);
@@ -274,7 +355,6 @@ pub fn sleep_ticks(ticks: u64) {
             return;
         }
         let cur = CURRENT_TASK;
-        // Task 0 (idle) should never enter Sleeping state
         if cur != 0 {
             TASKS[cur].state = TaskState::Sleeping(wake_tick);
         }
@@ -283,18 +363,17 @@ pub fn sleep_ticks(ticks: u64) {
 }
 
 /// Called from the timer IRQ handler every tick (100Hz).
-/// Wakes up sleeping tasks whose deadline has passed and accounts CPU time.
+/// Wakes up sleeping tasks whose deadline has passed and accounts CPU time & slice ticks.
 pub fn on_tick(current_tick: u64) {
     unsafe {
         if !INITIALIZED {
             return;
         }
 
-        // Increment CPU tick count for current task
         let cur = CURRENT_TASK;
         TASKS[cur].ticks_run += 1;
+        TASKS[cur].slice_ticks += 1;
 
-        // Wake up any sleeping tasks whose wake_tick has arrived
         for i in 1..MAX_TASKS {
             if let TaskState::Sleeping(wake_tick) = TASKS[i].state {
                 if current_tick >= wake_tick {
@@ -305,24 +384,56 @@ pub fn on_tick(current_tick: u64) {
     }
 }
 
+/// Called at the end of `irq_dispatch` (while IRQs are still masked on the current core).
+/// Preempts the running task if its time slice (`TIME_SLICE_TICKS`) has expired
+/// (or if it is the idle task) and another task is `Ready`.
+pub fn preempt_from_irq() {
+    unsafe {
+        if !INITIALIZED {
+            return;
+        }
+        let cur = CURRENT_TASK;
+        let slice_expired = cur == 0 || TASKS[cur].slice_ticks >= TIME_SLICE_TICKS;
+        if !slice_expired {
+            return;
+        }
+
+        // Check if any non-idle task is Ready to run
+        let mut has_ready = false;
+        for i in 1..MAX_TASKS {
+            if i != cur && TASKS[i].state == TaskState::Ready {
+                has_ready = true;
+                break;
+            }
+        }
+
+        if has_ready {
+            if cur != 0 {
+                TASKS[cur].preemptions += 1;
+                TOTAL_PREEMPTIONS += 1;
+            }
+            schedule_locked();
+        }
+    }
+}
+
 /// Internal scheduler — MUST be called with interrupts disabled.
 /// Selects the next Ready task in round-robin order and switches context.
 unsafe fn schedule_locked() {
+    reap_zombies_locked();
+
     let cur = CURRENT_TASK;
 
-    // If current task is still Running, mark it Ready so others can run
     if TASKS[cur].state == TaskState::Running {
         TASKS[cur].state = TaskState::Ready;
     }
+    TASKS[cur].slice_ticks = 0;
 
-    // Round-robin search starting from (cur + 1)
-    // Prefer non-idle tasks (1..MAX_TASKS) first if any are Ready;
-    // fall back to Task 0 (idle) if no other task is Ready.
     let mut next = None;
     for offset in 1..=MAX_TASKS {
         let idx = (cur + offset) % MAX_TASKS;
         if idx == 0 {
-            continue; // Check idle task last
+            continue;
         }
         if TASKS[idx].state == TaskState::Ready {
             next = Some(idx);
@@ -330,11 +441,12 @@ unsafe fn schedule_locked() {
         }
     }
 
-    let next_idx = next.unwrap_or(0); // Task 0 (idle) is always available
+    let next_idx = next.unwrap_or(0);
     TASKS[next_idx].state = TaskState::Running;
+    TASKS[next_idx].slice_ticks = 0;
 
     if next_idx == cur {
-        return; // Same task continues running
+        return;
     }
 
     TASKS[next_idx].switches += 1;
@@ -343,18 +455,29 @@ unsafe fn schedule_locked() {
     let old_ctx = &raw mut TASKS[cur].context;
     let new_ctx = &raw const TASKS[next_idx].context;
     __switch_context(old_ctx, new_ctx);
+
+    // After switching back to this task, reap any task that just finished
+    reap_zombies_locked();
 }
 
 /// Get the ID of the currently running task
-#[allow(dead_code)]
 pub fn current_id() -> usize {
     unsafe { CURRENT_TASK }
 }
 
 /// Get the name of the currently running task
-#[allow(dead_code)]
 pub fn current_name() -> &'static str {
     unsafe { TASKS[CURRENT_TASK].name }
+}
+
+/// Get total number of reaped tasks since boot
+pub fn reaped_count() -> u64 {
+    unsafe { TOTAL_REAPED }
+}
+
+/// Get total number of preemptions since boot
+pub fn preemptions_count() -> u64 {
+    unsafe { TOTAL_PREEMPTIONS }
 }
 
 /// Get the number of active (Ready, Running, or Sleeping) tasks
@@ -376,8 +499,8 @@ pub fn active_count() -> usize {
 /// Print a summary table of all tasks
 pub fn print_tasks() {
     interrupts::without_interrupts(|| unsafe {
-        crate::println!("PID  NAME          STATE       SCHED  STACK");
-        crate::println!("---  ------------  ----------  -----  -------------------");
+        crate::println!("PID  NAME          STATE       TICKS  PREEMPT  STACK");
+        crate::println!("---  ------------  ----------  -----  -------  -------------------");
         for i in 0..MAX_TASKS {
             let t = &TASKS[i];
             if t.state == TaskState::Unused {
@@ -391,8 +514,14 @@ pub fn print_tasks() {
                 TaskState::Finished => "FINISHED",
             };
             crate::println!(
-                " #{:<2} {:<12}  {:<10}  {:>5}  0x{:08x} ({}KB)",
-                t.id, t.name, state_str, t.switches, t.stack_base, t.stack_size / 1024
+                " #{:<2} {:<12}  {:<10}  {:>5}  {:>7}  0x{:08x} ({}KB)",
+                t.id,
+                t.name,
+                state_str,
+                t.ticks_run,
+                t.preemptions,
+                t.stack_base,
+                t.stack_size / 1024
             );
         }
     });

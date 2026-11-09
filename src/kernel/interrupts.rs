@@ -46,6 +46,7 @@ pub extern "C" fn irq_dispatch(_ctx: &ExceptionContext) {
 
     if source & IRQ_SRC_CNTPNSIRQ != 0 {
         timer::handle_irq();
+        crate::kernel::task::preempt_from_irq();
     }
 
     // Future: check other interrupt sources here
