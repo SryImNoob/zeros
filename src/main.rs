@@ -19,11 +19,13 @@ mod font;
 mod framebuffer;
 mod gpio;
 mod heap;
+mod ili9341;
 mod interrupts;
 mod mailbox;
 mod mmio;
 mod mmu;
 mod page_alloc;
+mod spi;
 mod timer;
 mod uart;
 
@@ -55,12 +57,22 @@ pub extern "C" fn kernel_main() -> ! {
     page_alloc::init(pages_start);
     mmu::init();
 
-    // ── Stage 4: Framebuffer + Console ──
-    // 320×240 matches the Argon POD ILI9341 resolution
+    // ── Stage 4: Display + Console ──
+    // Strategy: try GPU framebuffer first (works in QEMU and HDMI),
+    // then fall back to SPI ILI9341 (Argon POD real hardware).
     if framebuffer::init(320, 240) {
+        // GPU framebuffer available (QEMU or HDMI)
         console::init();
-        // From now on, println! writes to both UART and screen!
         println!("[OK] Console: 40x30 text, dual output (UART + screen)");
+    } else {
+        // No GPU framebuffer — try SPI display (real Argon POD hardware)
+        println!("[..] GPU framebuffer not available, trying SPI display...");
+        spi::init();
+        if ili9341::init() {
+            println!("[OK] ILI9341 SPI display initialized");
+        } else {
+            println!("[WARN] No display available — UART only mode");
+        }
     }
 
     // ── Stage 5: Timer ──
