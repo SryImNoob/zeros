@@ -6,5 +6,6 @@ pub mod gpio;
 pub mod input;
 pub mod mailbox;
 pub mod mmio;
+pub mod pwm;
 pub mod spi;
 pub mod uart;

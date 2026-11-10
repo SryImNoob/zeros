@@ -26,7 +26,7 @@ use core::fmt::Write;
 use crate::arch::timer;
 use crate::drivers::display::{self, colors, Color};
 use crate::drivers::input::{self, touch, InputEvent};
-use crate::drivers::mailbox;
+use crate::drivers::{mailbox, pwm};
 use crate::fs::fat32::{self, DirEntry};
 use crate::fs::vfs::{self, OpenMode};
 use crate::kernel::{console, task, tryboot};
@@ -209,6 +209,11 @@ impl UiState {
                                     self.activate_selected_entry();
                                 }
                                 self.needs_full_redraw = true;
+                            }
+                            Tab::InputTest => {
+                                // Cycle BCM2710 Hardware PWM0 Backlight Brightness (100% -> 75% -> 50% -> 25% -> 10%)
+                                pwm::cycle_brightness();
+                                self.needs_content_update = true;
                             }
                             _ => {
                                 self.needs_content_update = true;
@@ -404,6 +409,7 @@ impl UiState {
             Tab::SysMon => " B1:Tab B2:Prev B3:+Task  B4:RPiOS    ",
             Tab::Files if !self.viewing_file => " B1:Tab B2:Down B3:Open/CD B4:RPiOS   ",
             Tab::Files => " B1/B2/B3:Close Preview   B4:RPiOS    ",
+            Tab::InputTest => " B1:Tab B2:Prev B3:DimPWM B4:RPiOS    ",
             _ => " B1:NextTab B2:Prev B3:Ref B4:RPiOS   ",
         };
         display::draw_str(4, 228, footer, COL_ACCENT, COL_FOOTER_BG);
@@ -694,12 +700,23 @@ impl UiState {
         display::draw_str(14, 156, &line, colors::YELLOW, COL_CARD_BG);
 
         line.clear();
+        let pct = pwm::brightness();
         let _ = write!(
             line,
-            "Timer Ticks : {:>8} (100Hz IRQ)  ",
-            timer::ticks()
+            "PWM0 Backlight : {:>3}% (10.1kHz GPIO18)",
+            pct
         );
-        display::draw_str(14, 182, &line, COL_TEXT_DIM, COL_CARD_BG);
+        display::draw_str(14, 178, &line, COL_ACCENT, COL_CARD_BG);
+        display::draw_progress_bar(
+            14,
+            192,
+            292,
+            12,
+            pct,
+            colors::YELLOW,
+            COL_BG,
+            COL_CARD_BORDER,
+        );
     }
 
     fn draw_log_content(&self) {

@@ -31,7 +31,7 @@ use core::panic::PanicInfo;
 use arch::{mmu, timer};
 use drivers::block::sd;
 use drivers::display::{framebuffer, ili9341};
-use drivers::{gpio, input, spi, uart};
+use drivers::{gpio, input, pwm, spi, uart};
 use fs::fat32;
 use kernel::{console, interrupts, task, tryboot};
 use mm::{heap, page_alloc};
@@ -78,8 +78,9 @@ pub extern "C" fn kernel_main() -> ! {
     };
     if display_ok {
         console::init();
-        println!("== ZerOS v0.2.0 (AArch64 Bare-Metal) ==");
+        println!("== ZerOS v0.3.0 (AArch64 Bare-Metal) ==");
         println!("[OK] Console: 40x30 text + status bar");
+        pwm::init();
     }
 
     // ── Stage 5: Input (4 buttons + NEC IR + Resistive Touch) ──
