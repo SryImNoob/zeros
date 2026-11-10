@@ -6,6 +6,16 @@
 
 use crate::drivers::mmio;
 use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+/// When `true` on real hardware, PL011 `UART0` (`0x3F20_1000`) is owned by the
+/// onboard Bluetooth HCI driver (`GPIO 30..33`), so `println!` skips `UART0` TX.
+static BT_OWNS_UART0: AtomicBool = AtomicBool::new(false);
+
+/// Hand over (or release) PL011 `UART0` to the onboard Bluetooth HCI driver.
+pub fn set_bt_mode(enabled: bool) {
+    BT_OWNS_UART0.store(enabled, Ordering::Relaxed);
+}
 
 const UART_DR: usize = mmio::UART0_BASE;           // Data register
 const UART_FR: usize = mmio::UART0_BASE + 0x18;    // Flag register
@@ -41,6 +51,9 @@ pub fn init() {
 
 /// Send a single character (with timeout so stalled/unrouted UART never blocks boot)
 pub fn putc(c: u8) {
+    if BT_OWNS_UART0.load(Ordering::Relaxed) {
+        return;
+    }
     unsafe {
         let mut timeout = 2000u32;
         while mmio::read(UART_FR) & FR_TXFF != 0 {

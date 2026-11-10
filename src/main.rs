@@ -81,16 +81,21 @@ pub extern "C" fn kernel_main() -> ! {
         println!("== ZerOS v0.3.0 (AArch64 Bare-Metal) ==");
         println!("[OK] Console: 40x30 text + status bar");
         pwm::init();
+        console::set_gui_mode(true);
     }
 
-    // ── Stage 5: Input (4 buttons + NEC IR + Resistive Touch) & USB 2.0 OTG ──
+    // ── Stage 5: Input, USB 2.0 OTG, & Onboard Wi-Fi (SDIO1) ──
     input::init();
     drivers::usb::init();
     if !bsp::is_qemu() {
         tryboot::watchdog_feed(15);
     }
+    drivers::wifi::init();
+    if !bsp::is_qemu() {
+        tryboot::watchdog_feed(15);
+    }
 
-    // ── Stage 6: SD Card + FAT32 Filesystem + Tryboot A/B ──
+    // ── Stage 6: SD Card + FAT32 Filesystem + Bluetooth HCD Firmware + Tryboot A/B ──
     if sd::init() {
         if !bsp::is_qemu() {
             tryboot::watchdog_feed(15);
@@ -110,6 +115,10 @@ pub extern "C" fn kernel_main() -> ! {
                 }
             }
         }
+    }
+    drivers::bluetooth::init();
+    if !bsp::is_qemu() {
+        tryboot::watchdog_feed(15);
     }
     tryboot::init();
 

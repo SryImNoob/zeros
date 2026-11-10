@@ -26,7 +26,7 @@ use core::fmt::Write;
 use crate::arch::timer;
 use crate::drivers::display::{self, colors, Color};
 use crate::drivers::input::{self, touch, InputEvent};
-use crate::drivers::{mailbox, pwm, usb};
+use crate::drivers::{bluetooth, mailbox, pwm, usb, wifi};
 use crate::fs::fat32::{self, DirEntry};
 use crate::fs::vfs::{self, OpenMode};
 use crate::kernel::{console, task, tryboot};
@@ -216,8 +216,14 @@ impl UiState {
                                 self.needs_content_update = true;
                             }
                             Tab::KernelLog => {
-                                // Trigger USB Port Reset & Device Enumeration on Synopsys DWC2
+                                // Scan USB 2.0 Hub ports + refresh Wireless (Wi-Fi SDIO1 / BT HCI)
                                 usb::scan_port();
+                                if !wifi::status().initialized {
+                                    wifi::init();
+                                }
+                                if !bluetooth::status().hci_up {
+                                    bluetooth::init();
+                                }
                                 self.needs_content_update = true;
                             }
                         }
@@ -389,7 +395,7 @@ impl UiState {
             (Tab::SysMon, " 1:SYS    "),
             (Tab::Files, " 2:FILES  "),
             (Tab::InputTest, " 3:IO/PWM "),
-            (Tab::KernelLog, " 4:USB/LOG"),
+            (Tab::KernelLog, " 4:WLS/USB"),
         ];
         for (i, (t, label)) in tabs.iter().enumerate() {
             let x = (i as u32) * 80;
@@ -723,106 +729,118 @@ impl UiState {
 
     fn draw_log_content(&self) {
         let ust = usb::refresh_status();
+        let wst = wifi::status();
+        let bst = bluetooth::status();
+
         let mut hdr = String::with_capacity(38);
         let _ = write!(
             hdr,
-            "USB DWC2 OTG | Core:0x{:08X} (#{:>2})",
-            ust.snps_id, ust.scans_run
+            "WIFI SDIO1 | BT BLE | USB2.0 (#{:>2}) ",
+            ust.scans_run
         );
-        display::draw_str(14, 40, &hdr, COL_ACCENT, COL_CARD_BG);
-        display::fill_rect(14, 50, 292, 1, COL_CARD_BORDER);
+        display::draw_str(14, 38, &hdr, COL_ACCENT, COL_CARD_BG);
+        display::fill_rect(14, 48, 292, 1, COL_CARD_BORDER);
 
         let mut line = String::with_capacity(38);
-        if let Some(root) = ust.device {
-            if ust.hub_ports > 0 {
-                let _ = write!(
-                    line,
-                    "Root: {:04X}:{:04X} Hub({}p) {:<12}",
-                    root.vid,
-                    root.pid,
-                    ust.hub_ports,
-                    ust.speed.as_str()
-                );
-            } else {
-                let _ = write!(
-                    line,
-                    "Root: {:04X}:{:04X} Cls={:02X} {:<13}",
-                    root.vid,
-                    root.pid,
-                    root.dev_class,
-                    ust.speed.as_str()
-                );
-            }
-            display::draw_str(14, 54, &line, colors::YELLOW, COL_CARD_BG);
+        // 1. Onboard Wi-Fi SDIO1 Status (y = 52)
+        if wst.initialized {
+            let _ = write!(
+                line,
+                "WiFi: BCM{:05} R{} {:04X}:{:04X} S={:08X}",
+                wst.chip_id, wst.chip_rev, wst.vendor_id, wst.device_id, wst.backplane_sig
+            );
+            display::draw_str(14, 52, &line, colors::GREEN, COL_CARD_BG);
         } else {
             let _ = write!(
                 line,
-                "Mode: {:<4}  VBUS: {:<3}  Spd: {:<10}",
-                if ust.host_mode { "Host" } else { "Dev" },
-                if ust.port_powered { "ON" } else { "OFF" },
-                ust.speed.as_str()
+                "WiFi: SDIO1 GPIO34-39 WL_ON={} [B3] ",
+                if wst.wl_powered { "1" } else { "0" }
             );
-            display::draw_str(14, 54, &line, colors::WHITE, COL_CARD_BG);
+            display::draw_str(14, 52, &line, colors::YELLOW, COL_CARD_BG);
         }
 
+        // 2. Onboard Bluetooth 5.0 HCI / BLE Status (y = 63)
+        line.clear();
+        if bst.hci_up {
+            let _ = write!(
+                line,
+                "BT  : {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X} b{:04X} BLE:{}",
+                bst.bd_addr[0],
+                bst.bd_addr[1],
+                bst.bd_addr[2],
+                bst.bd_addr[3],
+                bst.bd_addr[4],
+                bst.bd_addr[5],
+                bst.hci_revision & 0x0FFF,
+                if bst.ble_advertising { "ON" } else { "NO" }
+            );
+            display::draw_str(14, 63, &line, colors::GREEN, COL_CARD_BG);
+        } else {
+            let _ = write!(line, "BT  : UART0 GPIO30-33 [Press B3]    ");
+            display::draw_str(14, 63, &line, colors::YELLOW, COL_CARD_BG);
+        }
+
+        // 3. USB 2.0 OTG Hub Downstream Slots 1 & 2 (y = 74, 85)
         for slot in 0..2usize {
             line.clear();
-            let y = 65 + (slot as u32) * 11;
+            let y = 74 + (slot as u32) * 11;
             if let Some(pinfo) = ust.downstream_devs[slot] {
                 if let Some(ds) = pinfo.device {
                     let _ = write!(
                         line,
-                        "P{}[A{}]:{:04X}:{:04X} Cls={:02X} {:<11}",
+                        "USB{}: P{}[A{}] {:04X}:{:04X} {:<12}",
+                        slot + 1,
                         pinfo.port,
                         pinfo.usb_addr,
                         ds.vid,
                         ds.pid,
-                        ds.dev_class,
                         pinfo.speed.as_str()
                     );
                 } else {
                     let _ = write!(
                         line,
-                        "P{}[A{}]:Attached ({:<10}) {:04X}  ",
+                        "USB{}: P{}[A{}] Attached ({:<10})  ",
+                        slot + 1,
                         pinfo.port,
                         pinfo.usb_addr,
-                        pinfo.speed.as_str(),
-                        pinfo.status
+                        pinfo.speed.as_str()
                     );
                 }
                 display::draw_str(14, y, &line, colors::GREEN, COL_CARD_BG);
-            } else if ust.hub_ports > 0 {
+            } else if let Some(root) = ust.device {
                 let _ = write!(
                     line,
-                    "USB #{}: [Empty] ({}-Port Hub)        ",
+                    "USB{}: [Empty] (Hub {:04X}:{:04X} {}p)   ",
                     slot + 1,
+                    root.vid,
+                    root.pid,
                     ust.hub_ports
                 );
                 display::draw_str(14, y, &line, colors::CYAN, COL_CARD_BG);
             } else if slot == 0 {
                 let _ = write!(
                     line,
-                    "Port: HPRT0=0x{:08X} [B3:ScanUSB] ",
+                    "USB1: HPRT0=0x{:08X} [B3:ScanAll]",
                     ust.hprt0_raw
                 );
                 display::draw_str(14, y, &line, colors::CYAN, COL_CARD_BG);
             } else {
-                let _ = write!(line, "Press B3 (ScanUSB) to enumerate bus ");
+                let _ = write!(line, "USB2: Press B3 to enumerate USB Hub ");
                 display::draw_str(14, y, &line, COL_TEXT_DIM, COL_CARD_BG);
             }
         }
 
         display::draw_str(
             14,
-            90,
+            98,
             "KERNEL CONSOLE RING BUFFER",
             COL_ACCENT,
             COL_CARD_BG,
         );
-        display::fill_rect(14, 99, 292, 1, COL_CARD_BORDER);
+        display::fill_rect(14, 107, 292, 1, COL_CARD_BORDER);
 
-        console::with_recent_logs(10, |i, line_str| {
-            let y = 104 + (i as u32) * 10;
+        console::with_recent_logs(9, |i, line_str| {
+            let y = 112 + (i as u32) * 10;
             let mut padded = String::with_capacity(36);
             let clipped = if line_str.len() > 36 {
                 &line_str[..36]
