@@ -9,3 +9,4 @@ pub mod mmio;
 pub mod pwm;
 pub mod spi;
 pub mod uart;
+pub mod usb;

@@ -30,6 +30,7 @@ pub const TAG_ALLOC_BUFFER: u32 = 0x0004_0001;
 pub const TAG_GET_PITCH: u32 = 0x0004_0008;
 pub const TAG_GET_CLOCK_RATE: u32 = 0x0003_0002;
 pub const TAG_GET_TEMPERATURE: u32 = 0x0003_0006;
+pub const TAG_SET_POWER_STATE: u32 = 0x0002_8001;
 pub const TAG_END: u32 = 0;
 
 // Response codes
@@ -122,4 +123,20 @@ pub fn get_arm_clock_hz() -> Option<u32> {
     } else {
         None
     }
+}
+
+/// Power on (`true`) or off (`false`) the BCM2710 USB HCD controller (Device ID = 3).
+pub fn set_usb_power(on: bool) -> bool {
+    let state = if on { 0b11 } else { 0b10 }; // bit 0 = On/Off, bit 1 = Wait for stabilization
+    let mut msg = AlignedPropBuf([
+        8 * 4,               // Total buffer size in bytes
+        0,                   // Request code
+        TAG_SET_POWER_STATE, // Tag: Set Power State
+        8,                   // Value buffer size (8 bytes)
+        8,                   // Request length
+        3,                   // Device ID 3 = USB HCD
+        state,               // Power state
+        TAG_END,
+    ]);
+    call(&mut msg.0) && (msg.0[6] & 1) == (state & 1)
 }

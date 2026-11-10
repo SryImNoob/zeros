@@ -83,8 +83,12 @@ pub extern "C" fn kernel_main() -> ! {
         pwm::init();
     }
 
-    // ── Stage 5: Input (4 buttons + NEC IR + Resistive Touch) ──
+    // ── Stage 5: Input (4 buttons + NEC IR + Resistive Touch) & USB 2.0 OTG ──
     input::init();
+    drivers::usb::init();
+    if !bsp::is_qemu() {
+        tryboot::watchdog_feed(15);
+    }
 
     // ── Stage 6: SD Card + FAT32 Filesystem + Tryboot A/B ──
     if sd::init() {

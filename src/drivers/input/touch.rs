@@ -55,10 +55,12 @@ pub fn is_touched() -> bool {
 
 /// Read raw 12-bit ADC channel from ADS7846 on SPI0 CE1 (`cs = 1`).
 fn read_adc(cmd: u8) -> u16 {
-    let tx = [cmd, 0x00, 0x00];
-    let mut rx = [0u8; 3];
-    spi::transfer_bytes_slow(1, &tx, &mut rx);
-    (((rx[1] as u16) << 8) | (rx[2] as u16)) >> 3
+    crate::kernel::interrupts::without_interrupts(|| {
+        let tx = [cmd, 0x00, 0x00];
+        let mut rx = [0u8; 3];
+        spi::transfer_bytes_slow(1, &tx, &mut rx);
+        (((rx[1] as u16) << 8) | (rx[2] as u16)) >> 3
+    })
 }
 
 /// Poll the touch controller. Returns `Some((x, y))` in 320x240 screen coordinates

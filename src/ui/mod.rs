@@ -26,7 +26,7 @@ use core::fmt::Write;
 use crate::arch::timer;
 use crate::drivers::display::{self, colors, Color};
 use crate::drivers::input::{self, touch, InputEvent};
-use crate::drivers::{mailbox, pwm};
+use crate::drivers::{mailbox, pwm, usb};
 use crate::fs::fat32::{self, DirEntry};
 use crate::fs::vfs::{self, OpenMode};
 use crate::kernel::{console, task, tryboot};
@@ -215,7 +215,9 @@ impl UiState {
                                 pwm::cycle_brightness();
                                 self.needs_content_update = true;
                             }
-                            _ => {
+                            Tab::KernelLog => {
+                                // Trigger USB Port Reset & Device Enumeration on Synopsys DWC2
+                                usb::scan_port();
                                 self.needs_content_update = true;
                             }
                         }
@@ -386,8 +388,8 @@ impl UiState {
         let tabs = [
             (Tab::SysMon, " 1:SYS    "),
             (Tab::Files, " 2:FILES  "),
-            (Tab::InputTest, " 3:INPUT  "),
-            (Tab::KernelLog, " 4:LOGS   "),
+            (Tab::InputTest, " 3:IO/PWM "),
+            (Tab::KernelLog, " 4:USB/LOG"),
         ];
         for (i, (t, label)) in tabs.iter().enumerate() {
             let x = (i as u32) * 80;
@@ -406,11 +408,11 @@ impl UiState {
 
         display::fill_rect(0, 224, 320, 16, COL_FOOTER_BG);
         let footer = match self.tab {
-            Tab::SysMon => " B1:Tab B2:Prev B3:+Task  B4:RPiOS    ",
+            Tab::SysMon => " B1:Tab B2:Prev B3:+Task   B4:RPiOS   ",
             Tab::Files if !self.viewing_file => " B1:Tab B2:Down B3:Open/CD B4:RPiOS   ",
-            Tab::Files => " B1/B2/B3:Close Preview   B4:RPiOS    ",
-            Tab::InputTest => " B1:Tab B2:Prev B3:DimPWM B4:RPiOS    ",
-            _ => " B1:NextTab B2:Prev B3:Ref B4:RPiOS   ",
+            Tab::Files => " B1/B2/B3:Close Preview    B4:RPiOS   ",
+            Tab::InputTest => " B1:Tab B2:Prev B3:DimPWM  B4:RPiOS   ",
+            Tab::KernelLog => " B1:Tab B2:Prev B3:ScanUSB B4:RPiOS   ",
         };
         display::draw_str(4, 228, footer, COL_ACCENT, COL_FOOTER_BG);
     }
@@ -720,17 +722,107 @@ impl UiState {
     }
 
     fn draw_log_content(&self) {
+        let ust = usb::refresh_status();
+        let mut hdr = String::with_capacity(38);
+        let _ = write!(
+            hdr,
+            "USB DWC2 OTG | Core:0x{:08X} (#{:>2})",
+            ust.snps_id, ust.scans_run
+        );
+        display::draw_str(14, 40, &hdr, COL_ACCENT, COL_CARD_BG);
+        display::fill_rect(14, 50, 292, 1, COL_CARD_BORDER);
+
+        let mut line = String::with_capacity(38);
+        if let Some(root) = ust.device {
+            if ust.hub_ports > 0 {
+                let _ = write!(
+                    line,
+                    "Root: {:04X}:{:04X} Hub({}p) {:<12}",
+                    root.vid,
+                    root.pid,
+                    ust.hub_ports,
+                    ust.speed.as_str()
+                );
+            } else {
+                let _ = write!(
+                    line,
+                    "Root: {:04X}:{:04X} Cls={:02X} {:<13}",
+                    root.vid,
+                    root.pid,
+                    root.dev_class,
+                    ust.speed.as_str()
+                );
+            }
+            display::draw_str(14, 54, &line, colors::YELLOW, COL_CARD_BG);
+        } else {
+            let _ = write!(
+                line,
+                "Mode: {:<4}  VBUS: {:<3}  Spd: {:<10}",
+                if ust.host_mode { "Host" } else { "Dev" },
+                if ust.port_powered { "ON" } else { "OFF" },
+                ust.speed.as_str()
+            );
+            display::draw_str(14, 54, &line, colors::WHITE, COL_CARD_BG);
+        }
+
+        for slot in 0..2usize {
+            line.clear();
+            let y = 65 + (slot as u32) * 11;
+            if let Some(pinfo) = ust.downstream_devs[slot] {
+                if let Some(ds) = pinfo.device {
+                    let _ = write!(
+                        line,
+                        "P{}[A{}]:{:04X}:{:04X} Cls={:02X} {:<11}",
+                        pinfo.port,
+                        pinfo.usb_addr,
+                        ds.vid,
+                        ds.pid,
+                        ds.dev_class,
+                        pinfo.speed.as_str()
+                    );
+                } else {
+                    let _ = write!(
+                        line,
+                        "P{}[A{}]:Attached ({:<10}) {:04X}  ",
+                        pinfo.port,
+                        pinfo.usb_addr,
+                        pinfo.speed.as_str(),
+                        pinfo.status
+                    );
+                }
+                display::draw_str(14, y, &line, colors::GREEN, COL_CARD_BG);
+            } else if ust.hub_ports > 0 {
+                let _ = write!(
+                    line,
+                    "USB #{}: [Empty] ({}-Port Hub)        ",
+                    slot + 1,
+                    ust.hub_ports
+                );
+                display::draw_str(14, y, &line, colors::CYAN, COL_CARD_BG);
+            } else if slot == 0 {
+                let _ = write!(
+                    line,
+                    "Port: HPRT0=0x{:08X} [B3:ScanUSB] ",
+                    ust.hprt0_raw
+                );
+                display::draw_str(14, y, &line, colors::CYAN, COL_CARD_BG);
+            } else {
+                let _ = write!(line, "Press B3 (ScanUSB) to enumerate bus ");
+                display::draw_str(14, y, &line, COL_TEXT_DIM, COL_CARD_BG);
+            }
+        }
+
         display::draw_str(
             14,
-            40,
+            90,
             "KERNEL CONSOLE RING BUFFER",
             COL_ACCENT,
             COL_CARD_BG,
         );
-        display::fill_rect(14, 50, 292, 1, COL_CARD_BORDER);
+        display::fill_rect(14, 99, 292, 1, COL_CARD_BORDER);
 
-        console::with_recent_logs(15, |i, line_str| {
-            let y = 56 + (i as u32) * 10;
+        console::with_recent_logs(10, |i, line_str| {
+            let y = 104 + (i as u32) * 10;
             let mut padded = String::with_capacity(36);
             let clipped = if line_str.len() > 36 {
                 &line_str[..36]
@@ -745,8 +837,6 @@ impl UiState {
 
 /// Interactive UI & Input Task — runs at 25Hz (every 40ms), polling buttons, IR, and Touch.
 pub fn ui_task() {
-    task::sleep_ms(1500);
-
     console::set_gui_mode(true);
     let mut ui = UiState::new();
     ui.render();
