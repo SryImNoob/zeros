@@ -26,6 +26,7 @@ pub struct PartitionInfo {
 #[derive(Debug, Clone)]
 pub struct DirEntry {
     pub name: String,
+    pub display_name: String,
     pub is_dir: bool,
     pub size: u32,
     pub first_cluster: u32,
@@ -255,6 +256,9 @@ pub fn list_dir(dir_cluster: u32) -> Vec<DirEntry> {
         dir_cluster
     };
     let mut sector_buf = [0u8; SECTOR_SIZE];
+    // LFN buffer: up to 8 LFN slots × 13 UTF-16LE chars = 104 chars
+    let mut lfn_slots = [[0u16; 13]; 8];
+    let mut lfn_max_slot = 0usize;
 
     loop {
         let base_lba = vol.cluster_to_lba(cluster);
@@ -276,20 +280,69 @@ pub fn list_dir(dir_cluster: u32) -> Vec<DirEntry> {
                 }
                 if first_byte == 0xE5 {
                     // Deleted entry
+                    lfn_max_slot = 0;
                     continue;
                 }
 
                 let attr = entry[11];
-                if attr == 0x0F || (attr & 0x08) != 0 {
-                    // Long File Name (LFN) entry or Volume Label — skip
+                if attr == 0x0F {
+                    // Long File Name (LFN) entry: extract 13 UTF-16LE code units
+                    let seq = (first_byte & 0x1F) as usize;
+                    if (first_byte & 0x40) != 0 {
+                        lfn_slots = [[0u16; 13]; 8];
+                        lfn_max_slot = 0;
+                    }
+                    if seq >= 1 && seq <= 8 {
+                        let slot = &mut lfn_slots[seq - 1];
+                        let byte_offs: [usize; 13] =
+                            [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+                        for (ci, &bo) in byte_offs.iter().enumerate() {
+                            slot[ci] = u16::from_le_bytes([entry[bo], entry[bo + 1]]);
+                        }
+                        if seq > lfn_max_slot {
+                            lfn_max_slot = seq;
+                        }
+                    }
+                    continue;
+                }
+
+                if (attr & 0x08) != 0 {
+                    // Volume Label — skip
+                    lfn_max_slot = 0;
                     continue;
                 }
 
                 let is_dir = (attr & 0x10) != 0;
                 let name = format_short_name(&entry[0..11]);
                 if name == "." {
+                    lfn_max_slot = 0;
                     continue; // Skip self-reference entry
                 }
+
+                let display_name = if lfn_max_slot > 0 {
+                    let mut u16_vec = Vec::with_capacity(lfn_max_slot * 13);
+                    'outer: for s_idx in 0..lfn_max_slot {
+                        for &ch16 in &lfn_slots[s_idx] {
+                            if ch16 == 0x0000 || ch16 == 0xFFFF {
+                                break 'outer;
+                            }
+                            u16_vec.push(ch16);
+                        }
+                    }
+                    lfn_max_slot = 0;
+                    let mut decoded = String::new();
+                    for ch_res in core::char::decode_utf16(u16_vec) {
+                        decoded.push(ch_res.unwrap_or('?'));
+                    }
+                    if decoded.is_empty() {
+                        name.clone()
+                    } else {
+                        decoded
+                    }
+                } else {
+                    name.clone()
+                };
+
                 let cluster_hi = u16::from_le_bytes([entry[20], entry[21]]) as u32;
                 let cluster_lo = u16::from_le_bytes([entry[26], entry[27]]) as u32;
                 let first_cluster = (cluster_hi << 16) | cluster_lo;
@@ -297,6 +350,7 @@ pub fn list_dir(dir_cluster: u32) -> Vec<DirEntry> {
 
                 entries.push(DirEntry {
                     name,
+                    display_name,
                     is_dir,
                     size,
                     first_cluster,
@@ -331,9 +385,9 @@ pub fn resolve_path(path: &str) -> Option<DirEntry> {
             continue;
         }
         let entries = list_dir(cur_cluster);
-        let found = entries
-            .into_iter()
-            .find(|e| eq_ignore_ascii_case(&e.name, part))?;
+        let found = entries.into_iter().find(|e| {
+            eq_ignore_ascii_case(&e.name, part) || eq_ignore_ascii_case(&e.display_name, part)
+        })?;
 
         if parts.peek().is_some() {
             if !found.is_dir {
@@ -421,6 +475,77 @@ pub fn read_file(path: &str) -> Option<Vec<u8>> {
     let n = read_entry_range(&target, 0, &mut data);
     data.truncate(n);
     Some(data)
+}
+
+/// Precompute the entire cluster chain of `entry` into a `Vec<u32>` for O(1) random sector reads.
+pub fn build_cluster_chain(entry: &DirEntry) -> Vec<u32> {
+    let mut chain = Vec::new();
+    if entry.first_cluster < 2 || entry.size == 0 {
+        return chain;
+    }
+    let vol = match unsafe { &*core::ptr::addr_of!(VOLUME) } {
+        Some(v) => v,
+        None => return chain,
+    };
+
+    let cluster_bytes = (vol.sectors_per_cluster as usize) * SECTOR_SIZE;
+    let max_clusters = ((entry.size as usize) + cluster_bytes - 1) / cluster_bytes;
+    chain.reserve(max_clusters);
+
+    let mut cur = entry.first_cluster;
+    let mut cached_fat_sec = u32::MAX;
+    let mut fat_buf = [0u8; SECTOR_SIZE];
+
+    while chain.len() < max_clusters {
+        chain.push(cur);
+        if chain.len() >= max_clusters {
+            break;
+        }
+        let fat_offset = cur * 4;
+        let fat_sector = vol.fat_start_lba + (fat_offset / 512);
+        let ent_offset = (fat_offset % 512) as usize;
+        if fat_sector != cached_fat_sec {
+            if !sd::read_sector(fat_sector, &mut fat_buf) {
+                break;
+            }
+            cached_fat_sec = fat_sector;
+        }
+        let val = u32::from_le_bytes([
+            fat_buf[ent_offset],
+            fat_buf[ent_offset + 1],
+            fat_buf[ent_offset + 2],
+            fat_buf[ent_offset + 3],
+        ]) & 0x0FFF_FFFF;
+        if val >= 0x0FFF_FFF8 || val < 2 {
+            break;
+        }
+        cur = val;
+    }
+    chain
+}
+
+/// Read a single 512-byte sector at `sector_index` (0 = first 512B of file) in O(1) using a precomputed cluster chain.
+pub fn read_sector_indexed(
+    chain: &[u32],
+    sector_index: usize,
+    buf: &mut [u8; SECTOR_SIZE],
+) -> bool {
+    let vol = match unsafe { &*core::ptr::addr_of!(VOLUME) } {
+        Some(v) => v,
+        None => return false,
+    };
+    let spc = vol.sectors_per_cluster as usize;
+    if spc == 0 {
+        return false;
+    }
+    let cluster_idx = sector_index / spc;
+    let sec_in_cluster = (sector_index % spc) as u32;
+    let cluster = match chain.get(cluster_idx) {
+        Some(&c) => c,
+        None => return false,
+    };
+    let lba = vol.cluster_to_lba(cluster) + sec_in_cluster;
+    sd::read_sector(lba, buf)
 }
 
 /// Update an existing small file (<= 512 bytes) given its `DirEntry`.

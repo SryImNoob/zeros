@@ -13,8 +13,8 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
 
-/// Heap size: 256 KB (backed by physical memory after kernel image)
-const HEAP_SIZE: usize = 256 * 1024;
+/// Heap size: 4 MB (backed by physical memory after kernel image)
+const HEAP_SIZE: usize = 4 * 1024 * 1024;
 
 /// Minimum block size (must fit FreeNode = 16 bytes)
 const MIN_BLOCK: usize = 32;
@@ -144,14 +144,36 @@ unsafe impl GlobalAlloc for KernelAllocator {
 
             // Read back-pointer to find block start
             let block_start = *((data_start - 8) as *const usize);
-
-            // Recover the block as a free node
             let node = block_start as *mut FreeNode;
-            // size field is still valid at block_start
 
-            // Insert at head of free list (O(1))
-            (*node).next = FREE_HEAD;
-            FREE_HEAD = node;
+            // Keep the free list sorted by ascending physical address so we can
+            // coalesce adjacent free blocks in O(N_free) and prevent heap fragmentation!
+            let mut prev: *mut FreeNode = ptr::null_mut();
+            let mut curr = FREE_HEAD;
+            while !curr.is_null() && (curr as usize) < block_start {
+                prev = curr;
+                curr = (*curr).next;
+            }
+
+            // 1. Coalesce forward with `curr` if physically adjacent
+            if !curr.is_null() && (block_start + (*node).size) == (curr as usize) {
+                (*node).size += (*curr).size;
+                (*node).next = (*curr).next;
+            } else {
+                (*node).next = curr;
+            }
+
+            // 2. Coalesce backward with `prev` if physically adjacent
+            if !prev.is_null() {
+                if (prev as usize) + (*prev).size == block_start {
+                    (*prev).size += (*node).size;
+                    (*prev).next = (*node).next;
+                } else {
+                    (*prev).next = node;
+                }
+            } else {
+                FREE_HEAD = node;
+            }
         })
     }
 }

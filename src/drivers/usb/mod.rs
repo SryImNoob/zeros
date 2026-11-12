@@ -342,7 +342,7 @@ unsafe fn dwc2_xfer_packet(
         if !is_in && len > 0 {
             DMA_BUF.bytes[..len].copy_from_slice(&buf[..len]);
         }
-        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+        crate::arch::mmu::dma_clean_invalidate(core::ptr::addr_of!(DMA_BUF) as usize, 64);
 
         if let Some((hub_addr, hub_port)) = split {
             // ─── Phase 1: Start-Split (SSPLIT) ───
@@ -409,6 +409,7 @@ unsafe fn dwc2_xfer_packet(
                 {
                     mmio::write(HCSPLT0, 0);
                     if is_in && len > 0 {
+                        crate::arch::mmu::dma_invalidate(core::ptr::addr_of!(DMA_BUF) as usize, 64);
                         let rem = (hctsiz & 0x7FFFF) as usize;
                         let rx = len.saturating_sub(rem.min(len));
                         let actual = if rx > 0 { rx } else { len };
@@ -460,6 +461,7 @@ unsafe fn dwc2_xfer_packet(
 
             if (hcint & HCINT_XFER_COMPL) != 0 {
                 if is_in && len > 0 {
+                    crate::arch::mmu::dma_invalidate(core::ptr::addr_of!(DMA_BUF) as usize, 64);
                     let rem = (hctsiz & 0x7FFFF) as usize;
                     let rx = len.saturating_sub(rem.min(len));
                     buf[..rx].copy_from_slice(&DMA_BUF.bytes[..rx]);

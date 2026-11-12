@@ -32,6 +32,28 @@ pub fn clear(color: Color) {
     fill_rect(0, 0, 320, 240, color);
 }
 
+/// Blit a rectangular sub-region `(x, y, w, h)` from a `320x240` off-screen RGB565 canvas
+/// to both the QEMU framebuffer (if active) and the physical ILI9341 SPI LCD.
+pub fn blit_rect(x: u32, y: u32, w: u32, h: u32, canvas: &[u16], canvas_width: u32) {
+    interrupts::without_interrupts(|| unsafe {
+        if let Some(ref fb) = *core::ptr::addr_of!(framebuffer::FB) {
+            let x1 = (x + w).min(fb.width).min(canvas_width);
+            let y1 = (y + h).min(fb.height);
+            let pitch_px = fb.pitch / 2;
+            for ry in y..y1 {
+                let src_base = (ry * canvas_width) as usize;
+                let dst_base = (ry * pitch_px) as isize;
+                for rx in x..x1 {
+                    *fb.buffer.offset(dst_base + rx as isize) = canvas[src_base + rx as usize];
+                }
+            }
+        }
+        if let Some(ref lcd) = *core::ptr::addr_of!(ili9341::DISPLAY) {
+            lcd.blit_rect(x, y, w, h, canvas, canvas_width);
+        }
+    });
+}
+
 /// Draw a 1-pixel or `thickness`-pixel rectangular border around `(x, y, w, h)`.
 pub fn draw_rect_border(x: u32, y: u32, w: u32, h: u32, thickness: u32, color: Color) {
     if w == 0 || h == 0 || thickness == 0 {

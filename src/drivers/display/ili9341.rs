@@ -197,6 +197,31 @@ impl Ili9341 {
         self.fill_rect(0, 0, self.width, self.height, color);
     }
 
+    /// Blit a rectangular region `(x, y, w, h)` from an off-screen RGB565 canvas (`fb` with stride `fb_width`)
+    /// in a single uninterrupted SPI burst.
+    pub fn blit_rect(&self, x: u32, y: u32, w: u32, h: u32, fb: &[u16], fb_width: u32) {
+        if x >= self.width || y >= self.height || w == 0 || h == 0 {
+            return;
+        }
+        let x1 = (x + w - 1).min(self.width - 1);
+        let y1 = (y + h - 1).min(self.height - 1);
+        let rw = (x1 - x + 1) as usize;
+        let rh = (y1 - y + 1) as usize;
+
+        self.set_window(x as u16, y as u16, x1 as u16, y1 as u16);
+        write_cmd(CMD_MEM_WRITE);
+        gpio_set(PIN_DC, true); // Data mode
+        spi::write_u16_stride_rect(
+            SPI_CS_DISPLAY,
+            fb,
+            fb_width as usize,
+            x as usize,
+            y as usize,
+            rw,
+            rh,
+        );
+    }
+
     /// Draw a character using the 8×8 font
     pub fn draw_char(&self, x: u32, y: u32, c: u8, fg: u16, bg: u16) {
         if x + 8 > self.width || y + 8 > self.height {

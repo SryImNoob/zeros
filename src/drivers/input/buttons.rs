@@ -42,11 +42,22 @@ const DEBOUNCE_THRESHOLD: u32 = 3;
 /// Input event types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputEvent {
-    ButtonPress(u8),    // Button index 0-3
-    ButtonRelease(u8),  // Button index 0-3
-    IrCode(u32),        // NEC IR code (addr + command)
-    Touch(u16, u16),    // Resistive touch screen coordinates (x, y) in 320x240
+    ButtonPress(u8),     // Short-press (or immediate press for B2/B3), button index 0-3
+    ButtonLongPress(u8), // Long-press (B1 >= 0.75s switches tab, B4 >= 1.2s reboots to Pi OS)
+    ButtonRelease(u8),   // Button index 0-3
+    IrCode(u32),         // NEC IR code (addr + command)
+    Touch(u16, u16),     // Resistive touch screen coordinates (x, y) in 320x240
 }
+
+struct ButtonHoldState {
+    press_tick: [u64; 4],
+    long_fired: [bool; 4],
+}
+
+static HOLD_STATE: IrqSafeLock<ButtonHoldState> = IrqSafeLock::new(ButtonHoldState {
+    press_tick: [0; 4],
+    long_fired: [false; 4],
+});
 
 /// Simple ring buffer for events protected by `IrqSafeLock` (no `static mut`)
 const EVENT_QUEUE_SIZE: usize = 16;
@@ -139,7 +150,10 @@ pub fn poll_buttons() {
     let mut counts = DEBOUNCE_COUNT.load(Ordering::Relaxed);
     let mut new_debounced = prev_debounced;
 
+    let now_tick = crate::arch::timer::ticks();
+
     for i in 0..4u32 {
+        let idx = i as usize;
         let raw_bit = (raw >> i) & 1;
         let prev_bit = (prev_raw >> i) & 1;
         let debounced_bit = (prev_debounced >> i) & 1;
@@ -157,10 +171,38 @@ pub fn poll_buttons() {
                 // State has changed and is stable
                 if raw_bit == 1 {
                     new_debounced |= 1 << i;
-                    push_event(InputEvent::ButtonPress(i as u8));
+                    HOLD_STATE.with(|h| {
+                        h.press_tick[idx] = now_tick;
+                        h.long_fired[idx] = false;
+                    });
+                    // B2 (1) and B3 (2) have no long-press role, so fire short-press immediately;
+                    // B1 (0) and B4 (3) defer short-press to release so long-press doesn't double-fire.
+                    if i == 1 || i == 2 {
+                        push_event(InputEvent::ButtonPress(i as u8));
+                    }
                 } else {
                     new_debounced &= !(1 << i);
+                    let was_long = HOLD_STATE.with(|h| h.long_fired[idx]);
+                    if (i == 0 || i == 3) && !was_long {
+                        push_event(InputEvent::ButtonPress(i as u8));
+                    }
                     push_event(InputEvent::ButtonRelease(i as u8));
+                }
+            } else if raw_bit == 1 && debounced_bit == 1 && (i == 0 || i == 3) {
+                // Button B1 (0) or B4 (3) is being held down — check long-press threshold
+                let threshold_ticks = if i == 0 { 75 } else { 120 }; // 0.75s for B1, 1.2s for B4
+                let fire_long = HOLD_STATE.with(|h| {
+                    if !h.long_fired[idx]
+                        && now_tick.saturating_sub(h.press_tick[idx]) >= threshold_ticks
+                    {
+                        h.long_fired[idx] = true;
+                        true
+                    } else {
+                        false
+                    }
+                });
+                if fire_long {
+                    push_event(InputEvent::ButtonLongPress(i as u8));
                 }
             }
         } else {

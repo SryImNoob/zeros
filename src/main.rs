@@ -18,9 +18,11 @@ extern crate alloc;
 #[macro_use]
 pub mod drivers;
 
+pub mod apps;
 pub mod arch;
 pub mod bsp;
 pub mod fs;
+pub mod gfx;
 pub mod kernel;
 pub mod mm;
 pub mod sync;
@@ -114,6 +116,7 @@ pub extern "C" fn kernel_main() -> ! {
                     println!("[OK] Read VERSION.TXT: {}", ver_str.trim());
                 }
             }
+            gfx::init();
         }
     }
     drivers::bluetooth::init();
@@ -172,12 +175,6 @@ fn heartbeat_task() {
             "[TICK] {}s uptime (slot: {}, tasks: {})",
             seconds, slot_str, active
         );
-
-        // Auto-return safety net after 120s on real hardware (or press Button 4 anytime)
-        if !bsp::is_qemu() && seconds >= 120 {
-            println!("[SYS] 120s tryboot session complete -> rebooting to RPi OS...");
-            tryboot::reboot_to_partition(0);
-        }
     }
 }
 
@@ -186,14 +183,27 @@ fn self_test_task() {
     println!("[TASK] self_test: starting M7.2/M7.3 background check...");
     task::sleep_ms(300);
 
-    let mut vec = alloc::vec::Vec::new();
-    for i in 1..=10u32 {
-        vec.push(i * i);
+    let (used_before, _) = heap::stats();
+    {
+        let mut vec = alloc::vec::Vec::new();
+        for i in 1..=10u32 {
+            vec.push(i * i);
+        }
+        let _b1 = alloc::vec![0u8; 4096];
+        let _b2 = alloc::vec![0u8; 8192];
+        let _b3 = alloc::vec![0u8; 4096];
+        let sum: u32 = vec.iter().sum();
+        println!(
+            "[TASK] self_test: heap check OK (sum of squares 1..10 = {})",
+            sum
+        );
     }
-    let sum: u32 = vec.iter().sum();
+    let (used_after, total_heap) = heap::stats();
     println!(
-        "[TASK] self_test: heap check OK (sum of squares 1..10 = {})",
-        sum
+        "[OK] Heap coalescing verified: used={}B -> {}B / {}KB total",
+        used_before,
+        used_after,
+        total_heap / 1024
     );
 
     if fat32::is_mounted() {

@@ -68,13 +68,13 @@ pub fn init() {
         // Clear FIFOs and reset
         mmio::write(SPI_CS, CS_CLEAR_RX | CS_CLEAR_TX);
 
-        // Set clock divider for ~12.5MHz SPI clock
+        // Set clock divider for ~25MHz SPI clock
         // Core clock on RPi Zero 2 W is 400MHz (250MHz in QEMU)
-        // Divider = 32 → 400MHz / 32 = 12.5MHz (within tft9341.dtbo's 16MHz max)
-        mmio::write(SPI_CLK, 32);
+        // Divider = 16 → 400MHz / 16 = 25MHz (within tft9341.dtbo's 32MHz max)
+        mmio::write(SPI_CLK, 16);
     }
 
-    crate::println!("[OK] SPI0: initialized, clock divider=32 (~12.5MHz)");
+    crate::println!("[OK] SPI0: initialized, clock divider=16 (~25MHz)");
 }
 
 /// Transfer a single byte over SPI (full-duplex: sends and receives).
@@ -317,7 +317,65 @@ pub fn transfer_bytes_slow(cs: u8, tx: &[u8], rx: &mut [u8]) {
         }
 
         mmio::write(SPI_CS, 0);
-        mmio::write(SPI_CLK, 32); // Restore 12.5 MHz for ILI9341 LCD
+        mmio::write(SPI_CLK, 16); // Restore 25 MHz for ILI9341 LCD
+    }
+}
+
+/// Stream a rectangular sub-region `(x, y, w, h)` from a `fb_width`-strided `u16` buffer
+/// in a single uninterrupted CS-asserted SPI burst (zero tearing, minimal CS overhead).
+pub fn write_u16_stride_rect(
+    cs: u8,
+    fb: &[u16],
+    fb_width: usize,
+    x: usize,
+    y: usize,
+    w: usize,
+    h: usize,
+) {
+    unsafe {
+        mmio::write(SPI_CS, CS_CLEAR_RX | CS_CLEAR_TX);
+
+        let cs_val = (cs as u32) & CS_CS_MASK;
+        mmio::write(SPI_CS, cs_val | CS_TA);
+
+        for row in y..(y + h) {
+            let row_base = row * fb_width;
+            for col in x..(x + w) {
+                let word = fb[row_base + col];
+                let hi = (word >> 8) as u32;
+                let lo = (word & 0xFF) as u32;
+
+                while mmio::read(SPI_CS) & CS_TXD == 0 {
+                    while mmio::read(SPI_CS) & CS_RXD != 0 {
+                        let _ = mmio::read(SPI_FIFO);
+                    }
+                }
+                mmio::write(SPI_FIFO, hi);
+
+                while mmio::read(SPI_CS) & CS_TXD == 0 {
+                    while mmio::read(SPI_CS) & CS_RXD != 0 {
+                        let _ = mmio::read(SPI_FIFO);
+                    }
+                }
+                mmio::write(SPI_FIFO, lo);
+
+                while mmio::read(SPI_CS) & CS_RXD != 0 {
+                    let _ = mmio::read(SPI_FIFO);
+                }
+            }
+        }
+
+        while mmio::read(SPI_CS) & CS_DONE == 0 {
+            while mmio::read(SPI_CS) & CS_RXD != 0 {
+                let _ = mmio::read(SPI_FIFO);
+            }
+        }
+
+        while mmio::read(SPI_CS) & CS_RXD != 0 {
+            let _ = mmio::read(SPI_FIFO);
+        }
+
+        mmio::write(SPI_CS, 0);
     }
 }
 

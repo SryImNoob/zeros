@@ -209,13 +209,17 @@ pub fn with_recent_logs<F: FnMut(usize, &str)>(count: usize, mut f: F) {
     });
 }
 
-/// Render the top status bar (row 0, `y = 0..8`)
+/// Render the top status bar (row 0, `y = 0..8`) when in text console mode.
 pub fn update_status_bar(uptime_sec: u64, tasks: usize, slot: &str) {
+    let is_gui = CONSOLE.with(|c| c.gui_mode);
+    if is_gui {
+        return;
+    }
     use core::fmt::Write;
     let mut bar = alloc::string::String::with_capacity(40);
     let _ = write!(
         bar,
-        " ZerOS v0.1 | Slot:{} | Tsk:{} | Up:{}s",
+        " ZerOS v0.4 | Slot:{} | Tsk:{} | Up:{}s",
         slot, tasks, uptime_sec
     );
 
