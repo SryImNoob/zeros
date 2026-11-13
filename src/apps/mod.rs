@@ -1,8 +1,8 @@
-// ZerOS — Application Framework & Intent Bus (`M9.5`)
+// ZerOS — Application Framework & Intent Bus (`M9.5` + `M10.1`)
 //
 // Decouples individual applications (`MusicApp`, `ReaderApp`, `MediaBtApp`, `SystemApp`)
 // from the `ui` Desktop Shell. Each application implements the `App` trait and communicates
-// cross-app navigation or media-open requests via `AppIntent`.
+// cross-app navigation, media-open, or Bluetooth scan/connect requests via `AppIntent`.
 
 pub mod media_bt;
 pub mod music;
@@ -50,12 +50,14 @@ impl AppId {
 }
 
 /// Cross-application message returned by an app to request shell-level actions
-/// (switching tabs, playing a track selected in the media library, or opening an e-book).
+/// (switching tabs, playing a track, opening an e-book, or scanning/connecting Bluetooth).
 pub enum AppIntent {
     None,
     SwitchApp(AppId),
     PlayTrack { title: String },
     OpenBook { title: String, content: String },
+    ScanBluetooth,
+    ConnectBluetooth(usize),
 }
 
 /// Standard interface implemented by all ZerOS graphical applications.

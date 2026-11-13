@@ -12,6 +12,7 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 
 use crate::apps::{App, AppId, AppIntent};
+use crate::drivers::bluetooth;
 use crate::drivers::display::{colors, Color};
 use crate::fs::fat32;
 use crate::gfx::Canvas;
@@ -176,9 +177,15 @@ impl App for MusicApp {
         // Song Title + Bluetooth Speaker Pill
         let track = &self.tracks[self.current_track];
         canvas.draw_mixed_text(74, 34, &track.title, colors::WHITE, 15);
+        let bt = bluetooth::status();
         canvas.fill_rrect(222, 34, 84, 15, 4, colors::rgb(20, 48, 44));
-        canvas.fill_circle(229, 41, 2, colors::rgb(60, 245, 150));
-        canvas.draw_str_ascii(235, 37, "ZerOS-BT", colors::rgb(95, 245, 170));
+        if bt.connected_index.is_some() {
+            canvas.fill_circle(229, 41, 2, colors::rgb(50, 250, 140));
+            canvas.draw_mixed_text(235, 35, "已连音箱", colors::rgb(95, 255, 170), 12);
+        } else {
+            canvas.fill_circle(229, 41, 2, colors::rgb(60, 215, 255));
+            canvas.draw_str_ascii(235, 37, "ZerOS-BT", colors::rgb(95, 245, 170));
+        }
 
         // Format + 14-Band Real-Time Spectrum Analyzer
         canvas.draw_str_ascii(74, 54, track.format_info, colors::rgb(150, 180, 220));

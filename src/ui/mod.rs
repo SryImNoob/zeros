@@ -80,6 +80,24 @@ impl DesktopShell {
                 self.reader_app.open_book(title, &content);
                 self.active_app = AppId::Reader;
             }
+            AppIntent::ScanBluetooth => {
+                // Immediately flush scanning banner to LCD before starting 5s HCI Inquiry
+                self.media_bt_app.set_scanning_banner();
+                self.needs_full_redraw = true;
+                self.render();
+                let found = bluetooth::scan_devices();
+                self.media_bt_app.on_scan_finished(found);
+                self.needs_full_redraw = true;
+            }
+            AppIntent::ConnectBluetooth(idx) => {
+                // Immediately flush connecting banner to LCD before starting ACL + SSP handshake
+                self.media_bt_app.set_connecting_banner(idx);
+                self.needs_full_redraw = true;
+                self.render();
+                let ok = bluetooth::connect_device(idx);
+                self.media_bt_app.on_connect_finished(idx, ok);
+                self.needs_full_redraw = true;
+            }
         }
     }
 
@@ -284,6 +302,9 @@ pub fn ui_task() {
     let mut sub_tick = 0u32;
 
     loop {
+        if !crate::bsp::is_qemu() {
+            tryboot::watchdog_feed(15);
+        }
         if let Some((tx, ty)) = touch::poll_touch() {
             input::push_event(InputEvent::Touch(tx, ty));
         }
