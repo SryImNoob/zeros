@@ -167,6 +167,16 @@ pub struct BluetoothStatus {
     pub acl_handle: u16,
     pub a2dp_ready: bool,
     pub last_conn_err: u8,
+    pub avdtp_sig_dcid: u16,
+    pub avdtp_media_dcid: u16,
+    pub acp_seid_shifted: u8,
+    pub sbc_cap0: u8,
+    pub sbc_cap1: u8,
+    pub sbc_bitpool: u8,
+    pub avdtp_streaming: bool,
+    pub a2dp_playing: bool,
+    pub a2dp_track: u8,
+    pub a2dp_packets_sent: u32,
 }
 
 impl BluetoothStatus {
@@ -190,6 +200,16 @@ impl BluetoothStatus {
             acl_handle: 0,
             a2dp_ready: false,
             last_conn_err: 0,
+            avdtp_sig_dcid: 0,
+            avdtp_media_dcid: 0,
+            acp_seid_shifted: 0x04,
+            sbc_cap0: 0x22, // 44.1kHz (0x20) | Stereo (0x02)
+            sbc_cap1: 0x15, // 16 blocks (0x10) | 8 subbands (0x04) | Loudness (0x01)
+            sbc_bitpool: 30,
+            avdtp_streaming: false,
+            a2dp_playing: true,
+            a2dp_track: 0,
+            a2dp_packets_sent: 0,
         }
     }
 }
@@ -550,6 +570,23 @@ fn is_audio_speaker_cod(cod: u32) -> bool {
     major == 0x04 || (cod & 0x240000) == 0x240000
 }
 
+#[inline]
+fn trim_ad_name(raw: &[u8]) -> &[u8] {
+    let mut end = 0usize;
+    while end < raw.len() && raw[end] != 0 {
+        end += 1;
+    }
+    let mut slice = &raw[..end];
+    while let Some(&last) = slice.last() {
+        if last == b' ' || last == b'\t' || last == b'\r' || last == b'\n' {
+            slice = &slice[..slice.len() - 1];
+        } else {
+            break;
+        }
+    }
+    slice
+}
+
 fn parse_ad_payload(ad: &[u8]) -> ParsedAdInfo<'_> {
     let mut idx = 0usize;
     let mut name: Option<&[u8]> = None;
@@ -566,10 +603,16 @@ fn parse_ad_payload(ad: &[u8]) -> ParsedAdInfo<'_> {
 
         match ad_type {
             0x09 if !body.is_empty() => {
-                name = Some(body);
+                let trimmed = trim_ad_name(body);
+                if !trimmed.is_empty() {
+                    name = Some(trimmed);
+                }
             }
             0x08 if !body.is_empty() && name.is_none() => {
-                name = Some(body);
+                let trimmed = trim_ad_name(body);
+                if !trimmed.is_empty() {
+                    name = Some(trimmed);
+                }
             }
             0x02 | 0x03 => {
                 let mut u = 0usize;
@@ -598,6 +641,13 @@ fn parse_ad_payload(ad: &[u8]) -> ParsedAdInfo<'_> {
                 if matches!(uuid, 0xFE2C | 0x184E | 0xFEBE | 0xFDDF) {
                     is_audio = true;
                 }
+                if uuid == 0xFE2C
+                    && body.len() >= 5
+                    && body[2..].windows(3).any(|w| w == [0x1C, 0x62, 0xE8])
+                    && name.is_none()
+                {
+                    name = Some(b"SRS-XB100");
+                }
             }
             0x19 if body.len() >= 2 => {
                 let app = u16::from_le_bytes([body[0], body[1]]);
@@ -610,7 +660,10 @@ fn parse_ad_payload(ad: &[u8]) -> ParsedAdInfo<'_> {
                 if cid == 0x012D {
                     is_audio = true;
                     // Sony Corporation (0x012D): Fast Pair Model ID `1C 62 E8` = Sony SRS-XB100
-                    if body.len() >= 12 && body[9..12] == [0x1C, 0x62, 0xE8] && name.is_none() {
+                    if body.len() >= 5
+                        && body[2..].windows(3).any(|w| w == [0x1C, 0x62, 0xE8])
+                        && name.is_none()
+                    {
                         name = Some(b"SRS-XB100");
                     }
                 }
@@ -695,16 +748,15 @@ fn upsert_discovered_device(
     }
 
     let is_audio = ad_info.is_audio || is_audio_speaker_cod(cod);
+    let clean_name = ad_info.name.map(trim_ad_name).filter(|n| !n.is_empty());
 
     for i in 0..*count {
         let same_bd = list[i].bd_addr == bd_disp
             || (list[i].has_alt_bd && list[i].alt_bd_addr == bd_disp);
-        let incoming_name = ad_info
-            .name
-            .filter(|n| !n.is_empty())
-            .or_else(|| ad_info.vendor_hint.map(|s| s.as_bytes()));
-        let same_real_name = match incoming_name {
-            Some(n) if list[i].name_len > 0 => list[i].name_str().as_bytes() == n,
+        let same_real_name = match clean_name {
+            Some(n) if list[i].has_real_name && list[i].name_len > 0 => {
+                list[i].name_str().as_bytes() == n
+            }
             _ => false,
         };
 
@@ -735,8 +787,8 @@ fn upsert_discovered_device(
             if rssi != 0 && rssi > list[i].rssi {
                 list[i].rssi = rssi;
             }
-            if let Some(n) = ad_info.name {
-                if !list[i].has_real_name || n.len() > (list[i].name_len as usize) {
+            if let Some(n) = clean_name {
+                if !list[i].has_real_name || n.len() >= (list[i].name_len as usize) {
                     list[i].set_name_bytes(n, true);
                 }
             } else if !list[i].has_real_name && ad_info.vendor_hint.is_some() {
@@ -746,14 +798,25 @@ fn upsert_discovered_device(
         }
     }
 
+    let new_score = (is_audio as i32) * 1000
+        + (clean_name.is_some() as i32) * 500
+        + ((!is_ble) as i32) * 300
+        + (rssi as i32);
+
     if *count >= MAX_DISCOVERED_DEVICES {
-        if ad_info.name.is_some() || is_audio || !is_ble {
-            if let Some((replace_idx, _)) = list[..*count]
-                .iter()
-                .enumerate()
-                .filter(|(_, d)| !d.has_real_name && !d.is_audio && d.is_ble)
-                .min_by_key(|(_, d)| d.rssi)
-            {
+        if let Some((replace_idx, worst_score)) = list[..*count]
+            .iter()
+            .enumerate()
+            .map(|(idx, d)| {
+                let s = (d.is_audio as i32) * 1000
+                    + (d.has_real_name as i32) * 500
+                    + ((!d.is_ble) as i32) * 300
+                    + (d.rssi as i32);
+                (idx, s)
+            })
+            .min_by_key(|&(_, s)| s)
+        {
+            if new_score > worst_score {
                 let mut info = BtDeviceInfo::empty();
                 info.valid = true;
                 info.bd_addr = bd_disp;
@@ -764,7 +827,7 @@ fn upsert_discovered_device(
                 info.is_audio = is_audio;
                 info.is_ble = is_ble;
                 info.le_addr_type = le_addr_type & 0x01;
-                if let Some(n) = ad_info.name {
+                if let Some(n) = clean_name {
                     info.set_name_bytes(n, true);
                 } else {
                     set_fallback_name(&mut info, ad_info.vendor_hint);
@@ -785,7 +848,7 @@ fn upsert_discovered_device(
     info.is_audio = is_audio;
     info.is_ble = is_ble;
     info.le_addr_type = le_addr_type & 0x01;
-    if let Some(n) = ad_info.name {
+    if let Some(n) = clean_name {
         info.set_name_bytes(n, true);
     } else {
         set_fallback_name(&mut info, ad_info.vendor_hint);
@@ -822,7 +885,8 @@ pub fn scan_devices() -> usize {
         return 6;
     }
 
-    if !status().hci_up {
+    let prev_snap = status();
+    if !prev_snap.hci_up {
         init();
     }
 
@@ -853,6 +917,8 @@ pub fn scan_devices() -> usize {
         );
         let _ = hci_send_cmd(0x0C56, &[0x01], &mut resp, 60);
         let _ = hci_send_cmd(0x0C45, &[0x02], &mut resp, 80);
+        // Set Page_Timeout (0x0C18) to 0x0E00 (2.24s) so Remote Name Requests never hang for 5.12s
+        let _ = hci_send_cmd(0x0C18, &[0x00, 0x0E], &mut resp, 60);
         drain_uart0_rx(2048);
 
         // 1. Classic Bluetooth Inquiry (0x0401): scan GIAC (0x9E8B33, 5.12s) + LIAC (0x9E8B00, 1.28s if no classic speaker yet)
@@ -868,6 +934,7 @@ pub fn scan_devices() -> usize {
                 let freq = timer::frequency();
                 let wait_tenths = if pass_idx == 0 { 54 } else { 16 };
                 let scan_deadline = timer::counter() + freq * wait_tenths / 10;
+                let mut got_inq_complete = false;
 
                 while timer::counter() < scan_deadline {
                     tryboot::watchdog_feed(15);
@@ -876,7 +943,10 @@ pub fn scan_devices() -> usize {
                     };
 
                     match evt_code {
-                        0x01 => break,
+                        0x01 => {
+                            got_inq_complete = true;
+                            break;
+                        }
                         0x2F if plen >= 15 => {
                             let mut bd_le = [0u8; 6];
                             bd_le.copy_from_slice(&evt[1..7]);
@@ -985,117 +1055,149 @@ pub fn scan_devices() -> usize {
                         _ => {}
                     }
                 }
-                let _ = hci_send_cmd(0x0402, &[], &mut resp, 60);
+                if !got_inq_complete {
+                    let _ = hci_send_cmd(0x0402, &[], &mut resp, 60);
+                }
                 drain_uart0_rx(1024);
             }
         }
 
         // 2. Resolve missing names via `HCI_Remote_Name_Request` (0x0419) for unnamed Classic devices
+        //    Prioritize unnamed Classic Audio devices (`is_audio = true`) first!
         let mut resolved = 0usize;
-        for i in 0..count {
-            if !list[i].has_real_name && !list[i].is_ble && resolved < 4 {
-                tryboot::watchdog_feed(15);
-                let bd_disp = list[i].bd_addr;
-                let bd_le = [
-                    bd_disp[5], bd_disp[4], bd_disp[3], bd_disp[2], bd_disp[1], bd_disp[0],
-                ];
-                let clk_hi = if list[i].clock_offset != 0 {
-                    (((list[i].clock_offset >> 8) & 0x7F) as u8) | 0x80
-                } else {
-                    0x00
-                };
-                let rnr_params: [u8; 10] = [
-                    bd_le[0],
-                    bd_le[1],
-                    bd_le[2],
-                    bd_le[3],
-                    bd_le[4],
-                    bd_le[5],
-                    list[i].page_scan_rep.min(2),
-                    0x00,
-                    (list[i].clock_offset & 0xFF) as u8,
-                    clk_hi,
-                ];
-                if hci_write_raw_cmd(0x0419, &rnr_params) {
-                    let freq = timer::frequency();
-                    let rnr_deadline = timer::counter() + freq * 22 / 10;
-                    while timer::counter() < rnr_deadline {
-                        tryboot::watchdog_feed(15);
-                        let Some((evt_code, plen)) = hci_read_event(&mut evt, 180) else {
-                            continue;
-                        };
-                        if evt_code == 0x07 && plen >= 8 {
-                            if evt[0] == 0x00 {
-                                list[i].set_name_bytes(&evt[7..plen], true);
+        for audio_pass in [true, false] {
+            for i in 0..count {
+                if !list[i].has_real_name
+                    && !list[i].is_ble
+                    && list[i].is_audio == audio_pass
+                    && resolved < 3
+                {
+                    tryboot::watchdog_feed(15);
+                    let bd_disp = list[i].bd_addr;
+                    let bd_le = [
+                        bd_disp[5], bd_disp[4], bd_disp[3], bd_disp[2], bd_disp[1], bd_disp[0],
+                    ];
+                    let clk_hi = if list[i].clock_offset != 0 {
+                        (((list[i].clock_offset >> 8) & 0x7F) as u8) | 0x80
+                    } else {
+                        0x00
+                    };
+                    let rnr_params: [u8; 10] = [
+                        bd_le[0],
+                        bd_le[1],
+                        bd_le[2],
+                        bd_le[3],
+                        bd_le[4],
+                        bd_le[5],
+                        list[i].page_scan_rep.min(2),
+                        0x00,
+                        (list[i].clock_offset & 0xFF) as u8,
+                        clk_hi,
+                    ];
+                    if hci_write_raw_cmd(0x0419, &rnr_params) {
+                        let freq = timer::frequency();
+                        let rnr_deadline = timer::counter() + freq * 24 / 10;
+                        let mut got_rnr_complete = false;
+                        while timer::counter() < rnr_deadline {
+                            tryboot::watchdog_feed(15);
+                            let Some((evt_code, plen)) = hci_read_event(&mut evt, 180) else {
+                                continue;
+                            };
+                            if evt_code == 0x07 && plen >= 7 && evt[1..7] == bd_le {
+                                got_rnr_complete = true;
+                                if evt[0] == 0x00 && plen >= 8 {
+                                    list[i].set_name_bytes(&evt[7..plen], true);
+                                }
+                                break;
                             }
-                            break;
+                        }
+                        if !got_rnr_complete {
+                            let _ = hci_send_cmd(0x041A, &bd_le, &mut resp, 60);
+                            let cancel_deadline = timer::counter() + freq * 2 / 10;
+                            while timer::counter() < cancel_deadline {
+                                let Some((ec, pl)) = hci_read_event(&mut evt, 50) else {
+                                    break;
+                                };
+                                if ec == 0x07 && pl >= 7 {
+                                    break;
+                                }
+                            }
                         }
                     }
-                    if !list[i].has_real_name {
-                        let _ = hci_send_cmd(0x041A, &bd_le, &mut resp, 60);
-                    }
+                    resolved += 1;
                 }
-                resolved += 1;
             }
         }
+        let _ = hci_send_cmd(0x0C18, &[0x00, 0x20], &mut resp, 60);
+        drain_uart0_rx(2048);
 
-        // 3. Perform a 2.0s BLE Active Scan (0x200B + 0x200C) with Interval=11.25ms (0x0012), Window=11.25ms (0x0012)
+        // 3. Perform two 1.2s BLE Active Scan passes (0x200B + 0x200C) with `Filter_Duplicates = 0x01`
+        //    so the 16-byte PL011 UART0 FIFO never overflows on iPhone/Mac beacon floods while still
+        //    capturing both `ADV_IND` and `SCAN_RSP` (e.g. Sony SRS-XB100 Fast Pair + Local Name)!
         tryboot::watchdog_feed(15);
+        let _ = hci_send_cmd(
+            0x2005,
+            &[0xD0, 0x55, 0x44, 0x33, 0x22, 0xC0],
+            &mut resp,
+            60,
+        );
         let scan_params: [u8; 7] = [0x01, 0x12, 0x00, 0x12, 0x00, 0x00, 0x00];
         let _ = hci_send_cmd(0x200B, &scan_params, &mut resp, 60);
-        if hci_send_cmd(0x200C, &[0x01, 0x00], &mut resp, 60).is_ok() {
-            let freq = timer::frequency();
-            let ble_deadline = timer::counter() + freq * 20 / 10;
-            while timer::counter() < ble_deadline {
-                tryboot::watchdog_feed(15);
-                let Some((evt_code, plen)) = hci_read_event(&mut evt, 80) else {
-                    continue;
-                };
-                if evt_code == 0x3E && plen >= 12 && evt[0] == 0x02 {
-                    let num_reports = evt[1] as usize;
-                    let mut pos = 2usize;
-                    for _ in 0..num_reports {
-                        if pos + 9 > plen {
-                            break;
-                        }
-                        let addr_type = evt[pos + 1];
-                        let mut bd_le = [0u8; 6];
-                        bd_le.copy_from_slice(&evt[pos + 2..pos + 8]);
-                        let data_len = evt[pos + 8] as usize;
-                        pos += 9;
-                        if pos + data_len + 1 > plen {
-                            break;
-                        }
-                        let ad_slice = &evt[pos..pos + data_len];
-                        let rssi = evt[pos + data_len] as i8;
-                        pos += data_len + 1;
 
-                        let ad_info = parse_ad_payload(ad_slice);
-                        if ad_info.name.is_some()
-                            || ad_info.is_audio
-                            || ad_info.vendor_hint.is_some()
-                            || rssi >= -78
-                        {
-                            upsert_discovered_device(
-                                &mut list,
-                                &mut count,
-                                &bd_le,
-                                0,
-                                rssi,
-                                1,
-                                0,
-                                &ad_info,
-                                true,
-                                addr_type,
-                            );
+        for _ble_pass in 0..2 {
+            if hci_send_cmd(0x200C, &[0x01, 0x01], &mut resp, 60).is_ok() {
+                let freq = timer::frequency();
+                let ble_deadline = timer::counter() + freq * 12 / 10;
+                while timer::counter() < ble_deadline {
+                    tryboot::watchdog_feed(15);
+                    let Some((evt_code, plen)) = hci_read_event(&mut evt, 80) else {
+                        continue;
+                    };
+                    if evt_code == 0x3E && plen >= 12 && evt[0] == 0x02 {
+                        let num_reports = evt[1] as usize;
+                        let mut pos = 2usize;
+                        for _ in 0..num_reports {
+                            if pos + 9 > plen {
+                                break;
+                            }
+                            let addr_type = evt[pos + 1];
+                            let mut bd_le = [0u8; 6];
+                            bd_le.copy_from_slice(&evt[pos + 2..pos + 8]);
+                            let data_len = evt[pos + 8] as usize;
+                            pos += 9;
+                            if pos + data_len + 1 > plen {
+                                break;
+                            }
+                            let ad_slice = &evt[pos..pos + data_len];
+                            let rssi = evt[pos + data_len] as i8;
+                            pos += data_len + 1;
+
+                            let ad_info = parse_ad_payload(ad_slice);
+                            if ad_info.name.is_some()
+                                || ad_info.is_audio
+                                || ad_info.vendor_hint.is_some()
+                                || rssi >= -78
+                            {
+                                upsert_discovered_device(
+                                    &mut list,
+                                    &mut count,
+                                    &bd_le,
+                                    0,
+                                    rssi,
+                                    1,
+                                    0,
+                                    &ad_info,
+                                    true,
+                                    addr_type,
+                                );
+                            }
                         }
                     }
                 }
+                let _ = hci_write_raw_cmd(0x200C, &[0x00, 0x00]);
+                timer::delay_ms(20);
+                drain_uart0_rx(4096);
             }
-            // Disable BLE Scan and drain all remaining 0x3E events so UART0 is 100% clean!
-            let _ = hci_write_raw_cmd(0x200C, &[0x00, 0x00]);
-            timer::delay_ms(30);
-            drain_uart0_rx(4096);
         }
 
         // 4. Restore Slave BLE Advertising ("ZerOS-Pi") + Classic Inquiry/Page Scan (0x03)
@@ -1146,34 +1248,89 @@ pub fn scan_devices() -> usize {
         i += 1;
     }
 
-    // Cross-link any remaining unnamed Classic Audio Speaker with a named BLE Audio Speaker
-    for b in 0..count {
+    // Merge any unnamed Classic Audio Speaker with a named BLE Audio Speaker (e.g. SRS-XB100 when Classic RNR timed out)
+    let mut b = 0usize;
+    while b < count {
         if list[b].is_ble && list[b].is_audio && list[b].has_real_name {
+            let mut merged_c: Option<usize> = None;
             for c in 0..count {
                 if c != b && !list[c].is_ble && list[c].is_audio && !list[c].has_real_name {
-                    list[b].alt_bd_addr = list[c].bd_addr;
+                    list[b].alt_bd_addr = list[b].bd_addr;
                     list[b].has_alt_bd = true;
+                    list[b].bd_addr = list[c].bd_addr;
+                    list[b].is_ble = false;
+                    list[b].cod = list[c].cod;
                     list[b].clock_offset = list[c].clock_offset;
                     list[b].page_scan_rep = list[c].page_scan_rep;
+                    if list[c].rssi > list[b].rssi {
+                        list[b].rssi = list[c].rssi;
+                    }
+                    merged_c = Some(c);
                     break;
                 }
             }
+            if let Some(c) = merged_c {
+                for k in c..(count - 1) {
+                    list[k] = list[k + 1];
+                }
+                list[count - 1] = BtDeviceInfo::empty();
+                count -= 1;
+                if c < b {
+                    continue;
+                }
+            }
+        }
+        b += 1;
+    }
+
+    // Preserve link keys and any previously paired/known audio speaker that is now in non-discoverable Page Scan standby
+    for p in 0..prev_snap.device_count.min(MAX_DISCOVERED_DEVICES) {
+        let prev = &prev_snap.devices[p];
+        if !prev.valid {
+            continue;
+        }
+        let mut found = false;
+        for i in 0..count {
+            let same_bd = list[i].bd_addr == prev.bd_addr
+                || (prev.has_alt_bd && list[i].bd_addr == prev.alt_bd_addr)
+                || (list[i].has_alt_bd && list[i].alt_bd_addr == prev.bd_addr);
+            let same_name = prev.has_real_name
+                && list[i].has_real_name
+                && list[i].name_str() == prev.name_str();
+            if same_bd || same_name {
+                found = true;
+                if prev.has_link_key && !list[i].has_link_key {
+                    list[i].has_link_key = true;
+                    list[i].link_key = prev.link_key;
+                }
+                if !prev.is_ble && list[i].is_ble {
+                    list[i].alt_bd_addr = list[i].bd_addr;
+                    list[i].has_alt_bd = true;
+                    list[i].bd_addr = prev.bd_addr;
+                    list[i].is_ble = false;
+                    list[i].cod = prev.cod;
+                }
+            }
+        }
+        if !found && prev.is_audio && prev.has_real_name && count < MAX_DISCOVERED_DEVICES {
+            list[count] = *prev;
+            count += 1;
         }
     }
 
-    // Sort priority: Classic Audio Speakers (`!is_ble && is_audio`) -> Audio -> Real Name -> Classic -> RSSI
+    // Sort priority: Named Audio Speakers -> Audio -> Real Name -> Classic -> RSSI
     for i in 1..count {
         let mut j = i;
         while j > 0 {
             let a = &list[j - 1];
             let b = &list[j];
             let score_a = (a.is_audio as i32) * 1000
-                + ((!a.is_ble) as i32) * 600
-                + (a.has_real_name as i32) * 400
+                + (a.has_real_name as i32) * 500
+                + ((!a.is_ble) as i32) * 300
                 + (a.rssi as i32);
             let score_b = (b.is_audio as i32) * 1000
-                + ((!b.is_ble) as i32) * 600
-                + (b.has_real_name as i32) * 400
+                + (b.has_real_name as i32) * 500
+                + ((!b.is_ble) as i32) * 300
                 + (b.rssi as i32);
             if score_b > score_a {
                 list.swap(j - 1, j);
@@ -1212,6 +1369,10 @@ struct ClassicConnState {
     sink_seid_count: usize,
     sink_seid_idx: usize,
     acp_seid_shifted: u8,
+    sbc_cap0: u8,
+    sbc_cap1: u8,
+    sbc_bitpool: u8,
+    avdtp_streaming: bool,
     info_rsp_received: bool,
     a2dp_ready: bool,
     ble_gatt_ready: bool,
@@ -1239,6 +1400,10 @@ impl ClassicConnState {
             sink_seid_count: 0,
             sink_seid_idx: 0,
             acp_seid_shifted: 0x04,
+            sbc_cap0: 0x22,
+            sbc_cap1: 0x15,
+            sbc_bitpool: 30,
+            avdtp_streaming: false,
             info_rsp_received: false,
             a2dp_ready: false,
             ble_gatt_ready: false,
@@ -1597,6 +1762,7 @@ unsafe fn handle_acl_l2cap_packet(
                     let rsp = [tx_label | 0x02, 0x07];
                     let _ = hci_send_l2cap(handle, cs.avdtp_sig_dcid, &rsp);
                     cs.a2dp_ready = true;
+                    cs.avdtp_streaming = true;
                 }
                 0x0D => {
                     // AVDTP_DELAYREPORT -> Response Accept
@@ -1639,7 +1805,7 @@ unsafe fn handle_acl_l2cap_packet(
                 0x02 | 0x0C => {
                     // Parse speaker's GET_CAPABILITIES response to find SBC (`Codec Type == 0x00`) and negotiate valid parameters
                     let mut is_sbc = false;
-                    let mut sbc_cap0 = 0x21u8;
+                    let mut sbc_cap0 = 0x22u8;
                     let mut sbc_cap1 = 0x15u8;
                     let mut sbc_min_bp = 0x02u8;
                     let mut sbc_max_bp = 0x35u8;
@@ -1670,10 +1836,11 @@ unsafe fn handle_acl_l2cap_packet(
                                 } else {
                                     0x80
                                 };
-                                let ch_bit = if (c0 & 0x01) != 0 {
-                                    0x01
-                                } else if (c0 & 0x02) != 0 {
+                                // Prefer pure STEREO (0x02) when supported by Sink, or Joint Stereo (0x01)
+                                let ch_bit = if (c0 & 0x02) != 0 {
                                     0x02
+                                } else if (c0 & 0x01) != 0 {
+                                    0x01
                                 } else if (c0 & 0x04) != 0 {
                                     0x04
                                 } else {
@@ -1705,6 +1872,9 @@ unsafe fn handle_acl_l2cap_packet(
                         let get_cap: [u8; 3] = [0x20, 0x02, cs.acp_seid_shifted];
                         let _ = hci_send_l2cap(handle, cs.avdtp_sig_dcid, &get_cap);
                     } else {
+                        cs.sbc_cap0 = sbc_cap0;
+                        cs.sbc_cap1 = sbc_cap1;
+                        cs.sbc_bitpool = 30u8.clamp(sbc_min_bp, sbc_max_bp);
                         let set_cfg: [u8; 14] = [
                             0x30,
                             0x03,
@@ -1739,6 +1909,10 @@ unsafe fn handle_acl_l2cap_packet(
                         let conn_req: [u8; 8] = [0x02, 0x22, 0x04, 0x00, 0x19, 0x00, 0x41, 0x00];
                         let _ = hci_send_l2cap(handle, 0x0001, &conn_req);
                     }
+                }
+                0x07 => {
+                    // AVDTP_START accepted -> Speaker is now in STREAMING state!
+                    cs.avdtp_streaming = true;
                 }
                 _ => {}
             }
@@ -1833,6 +2007,13 @@ pub fn connect_device(idx: usize) -> bool {
     let mut a2dp_ready = false;
     let mut ble_gatt_ready = false;
     let mut connected_classic_bd: Option<[u8; 6]> = None;
+    let mut saved_sig_dcid = 0u16;
+    let mut saved_media_dcid = 0u16;
+    let mut saved_acp_seid = 0x04u8;
+    let mut saved_sbc_cap0 = 0x22u8;
+    let mut saved_sbc_cap1 = 0x15u8;
+    let mut saved_sbc_bp = 30u8;
+    let mut saved_streaming = false;
     let mut last_err = 0xFFu8;
 
     unsafe {
@@ -2129,6 +2310,39 @@ pub fn connect_device(idx: usize) -> bool {
                                         }
                                     }
                                 }
+
+                                // Transition A2DP stream from OPEN to STREAMING (`AVDTP_START = 0x07`)
+                                if let Some(h) = connected_handle {
+                                    if !cs.avdtp_streaming && cs.avdtp_sig_dcid != 0 {
+                                        let start_cmd: [u8; 3] = [0x50, 0x07, cs.acp_seid_shifted];
+                                        let _ = hci_send_l2cap(h, cs.avdtp_sig_dcid, &start_cmd);
+                                        let start_end = timer::counter() + (freq * 15) / 100;
+                                        while timer::counter() < start_end {
+                                            let Some((pt, ev, pl)) = hci_read_packet(&mut pkt, 35)
+                                            else {
+                                                continue;
+                                            };
+                                            if pt == 0x02 {
+                                                reasm.feed_and_dispatch(
+                                                    h,
+                                                    ev,
+                                                    &pkt[..pl],
+                                                    &mut cs,
+                                                );
+                                                if cs.avdtp_streaming {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                saved_sig_dcid = cs.avdtp_sig_dcid;
+                                saved_media_dcid = cs.avdtp_media_dcid;
+                                saved_acp_seid = cs.acp_seid_shifted;
+                                saved_sbc_cap0 = cs.sbc_cap0;
+                                saved_sbc_cap1 = cs.sbc_cap1;
+                                saved_sbc_bp = cs.sbc_bitpool;
+                                saved_streaming = cs.avdtp_streaming;
                                 break;
                             }
 
@@ -2553,15 +2767,622 @@ pub fn connect_device(idx: usize) -> bool {
                 s.connected_index = Some(idx);
                 s.acl_handle = handle;
                 s.a2dp_ready = a2dp_ready;
+                s.avdtp_sig_dcid = saved_sig_dcid;
+                s.avdtp_media_dcid = saved_media_dcid;
+                s.acp_seid_shifted = saved_acp_seid;
+                s.sbc_cap0 = saved_sbc_cap0;
+                s.sbc_cap1 = saved_sbc_cap1;
+                s.sbc_bitpool = saved_sbc_bp;
+                s.avdtp_streaming = saved_streaming;
                 s.last_conn_err = 0;
             }
         });
+        unsafe {
+            A2DP_NEXT_TICK = 0;
+        }
         true
     } else {
         STATE.with(|s| {
             s.last_conn_err = last_err;
         });
         false
+    }
+}
+
+// ─── M10.2: Real-Time Bluetooth A2DP SBC Audio Encoder & Media Streamer ───
+
+static mut A2DP_SEQ: u16 = 1;
+static mut A2DP_TS: u32 = 0;
+static mut A2DP_SAMPLE_CURSOR: u32 = 0;
+static mut A2DP_NEXT_TICK: u64 = 0;
+
+/// Synchronize the `1.听歌` (`MusicApp`) playback state with the Bluetooth A2DP SBC audio streamer.
+pub fn set_a2dp_playback(playing: bool, track_idx: usize, pos_sec: u32) {
+    STATE.with(|s| {
+        let track_changed = s.a2dp_track != (track_idx as u8);
+        let resumed = !s.a2dp_playing && playing;
+        s.a2dp_playing = playing;
+        s.a2dp_track = track_idx as u8;
+        if track_changed || resumed {
+            unsafe {
+                A2DP_SAMPLE_CURSOR = pos_sec.wrapping_mul(44_100);
+                A2DP_NEXT_TICK = 0;
+            }
+        }
+    });
+}
+
+/// Scrub the A2DP audio synthesis cursor to `pos_sec` seconds when the user touches the progress bar.
+pub fn seek_a2dp_playback(pos_sec: u32) {
+    unsafe {
+        A2DP_SAMPLE_CURSOR = pos_sec.wrapping_mul(44_100);
+    }
+}
+
+/// Quarter-wave 64-entry sine lookup table (`0..=64` -> `0..=1024`)
+const SINE_Q64: [i32; 65] = [
+    0, 25, 50, 75, 100, 125, 150, 175, 199, 224, 248, 273, 297, 321, 345, 368, 392, 415, 438, 461,
+    483, 505, 527, 549, 570, 591, 612, 632, 652, 671, 690, 709, 727, 745, 762, 779, 796, 812, 828,
+    843, 857, 871, 885, 898, 910, 922, 934, 945, 955, 965, 974, 982, 990, 997, 1004, 1010, 1015,
+    1019, 1022, 1025, 1027, 1029, 1030, 1031, 1031,
+];
+
+#[inline(always)]
+fn fast_sin(phase_u8: u8) -> i32 {
+    let idx = (phase_u8 & 0x3F) as usize;
+    match (phase_u8 >> 6) & 3 {
+        0 => SINE_Q64[idx],
+        1 => SINE_Q64[64 - idx],
+        2 => -SINE_Q64[idx],
+        _ => -SINE_Q64[64 - idx],
+    }
+}
+
+/// Compute Bluetooth A2DP SBC CRC-8 (polynomial `0x1D`, initial preset `0x0F`, A2DP Spec 12.6.3.5)
+/// over the first `num_bits` bits of `data`.
+fn sbc_crc8(data: &[u8], num_bits: usize) -> u8 {
+    let mut crc: u8 = 0x0F;
+    let full_bytes = num_bits / 8;
+    for i in 0..full_bytes {
+        let mut b = data[i];
+        for _ in 0..8 {
+            let bit = (crc ^ b) & 0x80;
+            crc <<= 1;
+            if bit != 0 {
+                crc ^= 0x1D;
+            }
+            b <<= 1;
+        }
+    }
+    let rem_bits = num_bits % 8;
+    if rem_bits > 0 {
+        let mut b = data[full_bytes];
+        for _ in 0..rem_bits {
+            let bit = (crc ^ b) & 0x80;
+            crc <<= 1;
+            if bit != 0 {
+                crc ^= 0x1D;
+            }
+            b <<= 1;
+        }
+    }
+    crc
+}
+
+/// Official Bluetooth A2DP SBC Bit Allocation (`A2DP Spec v1.3 Section 12.6.4`) for 8 subbands.
+fn sbc_calculate_bits(
+    ch_mode: u8,
+    freq_idx: usize,
+    alloc_snr: bool,
+    bitpool: u8,
+    scale_factor: &[[i32; 8]; 2],
+    bits: &mut [[i32; 8]; 2],
+) {
+    const OFFSET8: [[i32; 8]; 4] = [
+        [-2, 0, 0, 0, 0, 0, 0, 1], // 16 kHz
+        [-3, 0, 0, 0, 0, 0, 1, 2], // 32 kHz
+        [-4, 0, 0, 0, 0, 0, 1, 2], // 44.1 kHz
+        [-4, 0, 0, 0, 0, 0, 1, 2], // 48 kHz
+    ];
+    let bp = bitpool as i32;
+
+    if ch_mode == 0x08 || ch_mode == 0x04 {
+        // MONO (0x08) or DUAL_CHANNEL (0x04): independent per-channel bit allocation
+        let num_ch = if ch_mode == 0x08 { 1 } else { 2 };
+        for ch in 0..num_ch {
+            let mut bitneed = [0i32; 8];
+            let mut max_bitneed = 0i32;
+            for sb in 0..8 {
+                let bn = if alloc_snr {
+                    scale_factor[ch][sb]
+                } else {
+                    let sf = scale_factor[ch][sb];
+                    if sf == 0 {
+                        -5
+                    } else {
+                        let v = sf - OFFSET8[freq_idx & 3][sb];
+                        if v > 0 { v / 2 } else { v }
+                    }
+                };
+                bitneed[sb] = bn;
+                if bn > max_bitneed {
+                    max_bitneed = bn;
+                }
+            }
+            let mut bitcount = 0i32;
+            let mut slicecount = 0i32;
+            let mut bitslice = max_bitneed + 1;
+            loop {
+                bitslice -= 1;
+                bitcount += slicecount;
+                slicecount = 0;
+                for sb in 0..8 {
+                    if bitneed[sb] > bitslice + 1 && bitneed[sb] < bitslice + 16 {
+                        slicecount += 1;
+                    } else if bitneed[sb] == bitslice + 1 {
+                        slicecount += 2;
+                    }
+                }
+                if bitcount + slicecount >= bp {
+                    break;
+                }
+            }
+            if bitcount + slicecount == bp {
+                bitcount += slicecount;
+                bitslice -= 1;
+            }
+            for sb in 0..8 {
+                if bitneed[sb] < bitslice + 2 {
+                    bits[ch][sb] = 0;
+                } else {
+                    bits[ch][sb] = (bitneed[sb] - bitslice).min(16);
+                }
+            }
+            let mut sb = 0usize;
+            while bitcount < bp && sb < 8 {
+                if bits[ch][sb] >= 2 && bits[ch][sb] < 16 {
+                    bits[ch][sb] += 1;
+                    bitcount += 1;
+                } else if bitneed[sb] == bitslice + 1 && bp > bitcount + 1 {
+                    bits[ch][sb] = 2;
+                    bitcount += 2;
+                }
+                sb += 1;
+            }
+            sb = 0;
+            while bitcount < bp && sb < 8 {
+                if bits[ch][sb] < 16 {
+                    bits[ch][sb] += 1;
+                    bitcount += 1;
+                }
+                sb += 1;
+            }
+        }
+    } else {
+        // STEREO (0x02) or JOINT_STEREO (0x01): joint bit allocation across both channels
+        let mut bitneed = [[0i32; 8]; 2];
+        let mut max_bitneed = 0i32;
+        for ch in 0..2 {
+            for sb in 0..8 {
+                let bn = if alloc_snr {
+                    scale_factor[ch][sb]
+                } else {
+                    let sf = scale_factor[ch][sb];
+                    if sf == 0 {
+                        -5
+                    } else {
+                        let v = sf - OFFSET8[freq_idx & 3][sb];
+                        if v > 0 { v / 2 } else { v }
+                    }
+                };
+                bitneed[ch][sb] = bn;
+                if bn > max_bitneed {
+                    max_bitneed = bn;
+                }
+            }
+        }
+        let mut bitcount = 0i32;
+        let mut slicecount = 0i32;
+        let mut bitslice = max_bitneed + 1;
+        loop {
+            bitslice -= 1;
+            bitcount += slicecount;
+            slicecount = 0;
+            for ch in 0..2 {
+                for sb in 0..8 {
+                    if bitneed[ch][sb] > bitslice + 1 && bitneed[ch][sb] < bitslice + 16 {
+                        slicecount += 1;
+                    } else if bitneed[ch][sb] == bitslice + 1 {
+                        slicecount += 2;
+                    }
+                }
+            }
+            if bitcount + slicecount >= bp {
+                break;
+            }
+        }
+        if bitcount + slicecount == bp {
+            bitcount += slicecount;
+            bitslice -= 1;
+        }
+        for ch in 0..2 {
+            for sb in 0..8 {
+                if bitneed[ch][sb] < bitslice + 2 {
+                    bits[ch][sb] = 0;
+                } else {
+                    bits[ch][sb] = (bitneed[ch][sb] - bitslice).min(16);
+                }
+            }
+        }
+        for ch in 0..2 {
+            for sb in 0..8 {
+                if bitcount >= bp {
+                    break;
+                }
+                if bits[ch][sb] >= 2 && bits[ch][sb] < 16 {
+                    bits[ch][sb] += 1;
+                    bitcount += 1;
+                } else if bitneed[ch][sb] == bitslice + 1 && bp > bitcount + 1 {
+                    bits[ch][sb] = 2;
+                    bitcount += 2;
+                }
+            }
+        }
+        for ch in 0..2 {
+            for sb in 0..8 {
+                if bitcount >= bp {
+                    break;
+                }
+                if bits[ch][sb] < 16 {
+                    bits[ch][sb] += 1;
+                    bitcount += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Encode a single 16-block, 8-subband Bluetooth A2DP SBC frame (`72` bytes in Stereo, `73` in Joint Stereo)
+/// containing synthesized polyphonic stereo audio for Track 0 (`七里香 - 周杰伦`) or Track 1 (`夜曲 - 周杰伦`).
+fn encode_sbc_frame(
+    sbc_cap0: u8,
+    sbc_cap1: u8,
+    bitpool: u8,
+    track_idx: u8,
+    sample_cursor: &mut u32,
+    out: &mut [u8],
+) -> usize {
+    // 32-step recognizable melody + chord accompaniment + bassline for:
+    //   - Track 0: 《七里香 - 周杰伦》 ("雨下整夜 我的爱溢出就像雨水 / 院子落叶 跟我的思念厚厚一叠...")
+    //   - Track 1: 《夜曲 - 周杰伦》 ("为你弹奏肖邦的夜曲 纪念我死去的爱情...")
+    const QILIXIANG_MELODY: [u16; 32] = [
+        659, 784, 784, 659, 587, 659, 784, 587, // E5 G5 G5 E5 | D5 E5 G5 D5
+        523, 440, 392, 392, 523, 587, 659, 659, // C5 A4 G4 G4 | C5 D5 E5 E5
+        659, 784, 784, 659, 587, 659, 880, 784, // E5 G5 G5 E5 | D5 E5 A5 G5
+        587, 659, 698, 659, 587, 523, 494, 523, // D5 E5 F5 E5 | D5 C5 B4 C5
+    ];
+    const QILIXIANG_CHORD: [u16; 32] = [
+        523, 523, 494, 494, 440, 440, 392, 392, // C5  B4  A4  G4
+        349, 349, 392, 392, 330, 330, 440, 440, // F4  G4  E4  A4
+        349, 349, 392, 392, 330, 330, 440, 440, // F4  G4  E4  A4
+        349, 349, 392, 392, 392, 330, 392, 392, // F4  G4  G4  C4/G4
+    ];
+    const QILIXIANG_BASS: [u16; 32] = [
+        262, 262, 247, 247, 220, 220, 196, 196, // C4  B3  A3  G3
+        175, 175, 196, 196, 165, 165, 220, 220, // F3  G3  E3  A3
+        175, 175, 196, 196, 165, 165, 220, 220, // F3  G3  E3  A3
+        147, 147, 196, 196, 196, 131, 196, 262, // D3  G3  G3  C4
+    ];
+
+    const YEQU_MELODY: [u16; 32] = [
+        659, 659, 659, 523, 494, 440, 494, 523, // E5 E5 E5 C5 | B4 A4 B4 C5
+        587, 587, 587, 494, 440, 392, 440, 494, // D5 D5 D5 B4 | A4 G4 A4 B4
+        523, 523, 523, 440, 392, 349, 392, 440, // C5 C5 C5 A4 | G4 F4 G4 A4
+        494, 523, 494, 392, 440, 440, 330, 440, // B4 C5 B4 G4 | A4 A4 E4 A4
+    ];
+    const YEQU_CHORD: [u16; 32] = [
+        330, 440, 330, 440, 294, 392, 294, 392, // Am / Em
+        349, 440, 349, 440, 330, 392, 330, 392, // F  / C
+        294, 349, 294, 349, 262, 330, 262, 330, // Dm / Am
+        247, 330, 247, 330, 220, 330, 220, 330, // E7 / Am
+    ];
+    const YEQU_BASS: [u16; 32] = [
+        220, 220, 220, 220, 165, 165, 165, 165, // A3 / E3
+        175, 175, 175, 175, 131, 131, 131, 131, // F3 / C3
+        147, 147, 147, 147, 220, 220, 220, 220, // D3 / A3
+        165, 165, 165, 165, 220, 220, 220, 220, // E3 / A3
+    ];
+
+    let (freq_idx, sample_rate) = if (sbc_cap0 & 0x80) != 0 {
+        (0usize, 16_000u32)
+    } else if (sbc_cap0 & 0x40) != 0 {
+        (1usize, 32_000u32)
+    } else if (sbc_cap0 & 0x10) != 0 {
+        (3usize, 48_000u32)
+    } else {
+        (2usize, 44_100u32)
+    };
+
+    let ch_mode = sbc_cap0 & 0x0F;
+    let num_ch = if ch_mode == 0x08 { 1usize } else { 2usize };
+    let alloc_snr = (sbc_cap1 & 0x02) != 0;
+
+    // Synthesize 16 subband blocks (`16 * 8 = 128` PCM samples per SBC frame)
+    // Subband 0 (`0 .. 2756 Hz` at 44.1 kHz) carries the fundamental + 2nd harmonic at full 16-bit resolution.
+    let mut sb_samples = [[[0i32; 8]; 2]; 16];
+    let step_samples = 14_336u32; // ~0.325s per eighth-note step at 44.1 kHz
+
+    for blk in 0..16 {
+        let s_idx = *sample_cursor;
+        *sample_cursor = sample_cursor.wrapping_add(8);
+
+        let note_step = ((s_idx / step_samples) as usize) & 31;
+        let note_pos = s_idx % step_samples;
+
+        let (f_mel, f_chd, f_bas) = if track_idx == 0 {
+            (
+                QILIXIANG_MELODY[note_step] as u64,
+                QILIXIANG_CHORD[note_step] as u64,
+                QILIXIANG_BASS[note_step] as u64,
+            )
+        } else {
+            (
+                YEQU_MELODY[note_step] as u64,
+                YEQU_CHORD[note_step] as u64,
+                YEQU_BASS[note_step] as u64,
+            )
+        };
+
+        // Smooth electric-piano ADSR envelope (soft 8ms attack + natural exponential decay)
+        let env: i32 = if note_pos < 360 {
+            ((note_pos * 256) / 360) as i32
+        } else {
+            let decay = ((note_pos - 360) * 165) / step_samples;
+            (256i32 - decay as i32).max(75)
+        };
+
+        // Compute continuous phase (`0..255`) for melody, 2nd harmonic, chord, and bass
+        let sr = sample_rate as u64;
+        let p_mel = (((s_idx as u64) * f_mel * 256) / sr) as u8;
+        let p_mel2 = p_mel.wrapping_mul(2);
+        let p_chd = (((s_idx as u64) * f_chd * 256) / sr) as u8;
+        let p_bas = (((s_idx as u64) * f_bas * 256) / sr) as u8;
+
+        // Warm electric-piano / music-box timbre: fundamental + 2nd harmonic + chord + bass
+        let mel_wave = (fast_sin(p_mel) * 5 + fast_sin(p_mel2) * 2) * env / (7 * 256);
+        let chd_wave = (fast_sin(p_chd) * (env + 128)) / 512;
+        let bas_wave = fast_sin(p_bas);
+
+        // Stereo mix (`[-6800 .. +6800]`, fits comfortably in `scale_factor = 12` -> `[-8192 .. +8192]`)
+        let left_sb0 = (mel_wave * 4 + chd_wave * 2 + bas_wave * 2).clamp(-7600, 7600);
+        let right_sb0 = (mel_wave * 4 + chd_wave * 3 + bas_wave).clamp(-7600, 7600);
+
+        sb_samples[blk][0][0] = left_sb0;
+        sb_samples[blk][1][0] = right_sb0;
+    }
+
+    // Set `scale_factor[ch][0] = 12` (`2^13 = 8192` full scale) and `scale_factor[ch][1] = 2`
+    let mut scale_factor = [[0i32; 8]; 2];
+    for ch in 0..num_ch {
+        scale_factor[ch][0] = 12;
+        scale_factor[ch][1] = 2;
+    }
+
+    let mut bits = [[0i32; 8]; 2];
+    sbc_calculate_bits(ch_mode, freq_idx, alloc_snr, bitpool, &scale_factor, &mut bits);
+
+    // 1. Pack 4-byte SBC Frame Header
+    let ch_mode_bits: u8 = match ch_mode {
+        0x08 => 0b00, // Mono
+        0x04 => 0b01, // Dual Channel
+        0x02 => 0b10, // Stereo
+        _ => 0b11,    // Joint Stereo
+    };
+    let hdr1: u8 = ((freq_idx as u8) << 6)
+        | (0b11 << 4) // 16 blocks
+        | (ch_mode_bits << 2)
+        | ((alloc_snr as u8) << 1)
+        | 0x01; // 8 subbands
+
+    out[0] = 0x9C; // Syncword
+    out[1] = hdr1;
+    out[2] = bitpool;
+
+    // 2. Pack Scale Factors (and optional Joint Stereo `join = 0x00` byte) + compute CRC-8
+    let mut crc_buf = [0u8; 11];
+    crc_buf[0] = hdr1;
+    crc_buf[1] = bitpool;
+    let mut crc_bits = 16usize;
+    let mut pos = 4usize;
+
+    if ch_mode == 0x01 {
+        // Joint Stereo: 8-bit `join` flags (`0x00` = no subbands joined)
+        out[pos] = 0x00;
+        pos += 1;
+        crc_buf[2] = 0x00;
+        crc_bits += 8;
+    }
+
+    let sf_crc_start = crc_bits / 8;
+    for ch in 0..num_ch {
+        for sb_pair in 0..4 {
+            let sf0 = (scale_factor[ch][sb_pair * 2] as u8) & 0x0F;
+            let sf1 = (scale_factor[ch][sb_pair * 2 + 1] as u8) & 0x0F;
+            let b = (sf0 << 4) | sf1;
+            out[pos] = b;
+            crc_buf[sf_crc_start + ch * 4 + sb_pair] = b;
+            pos += 1;
+            crc_bits += 8;
+        }
+    }
+
+    out[3] = sbc_crc8(&crc_buf, crc_bits);
+
+    // 3. Quantize & pack 16 blocks of subband samples MSB-first into `out[pos..]`
+    let mut bit_acc: u32 = 0;
+    let mut bit_cnt: u32 = 0;
+
+    for blk in 0..16 {
+        for ch in 0..num_ch {
+            for sb in 0..8 {
+                let b = bits[ch][sb] as u32;
+                if b > 0 {
+                    let levels = (1i64 << b) - 1;
+                    let sf = scale_factor[ch][sb] as u32;
+                    let s = sb_samples[blk][ch][sb] as i64;
+                    let num = (s + (1i64 << (sf + 1))) * levels;
+                    let q = (num >> (sf + 2)).clamp(0, levels - 1) as u32;
+
+                    bit_acc = (bit_acc << b) | (q & ((1u32 << b) - 1));
+                    bit_cnt += b;
+                    while bit_cnt >= 8 {
+                        bit_cnt -= 8;
+                        out[pos] = ((bit_acc >> bit_cnt) & 0xFF) as u8;
+                        pos += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if bit_cnt > 0 {
+        out[pos] = ((bit_acc << (8 - bit_cnt)) & 0xFF) as u8;
+        pos += 1;
+    }
+
+    pos
+}
+
+/// Non-blockingly drain any incoming HCI Events (`0x04`) or ACL packets (`0x02`) on `UART0`
+/// and transmit hardware-timer-paced RTP + A2DP SBC audio frames (`5` frames/pkt = `640` samples = `14.51 ms`)
+/// to the connected Bluetooth speaker (`SRS-XB100`).
+pub fn pump_a2dp_audio() {
+    if bsp::is_qemu() {
+        return;
+    }
+
+    let st = status();
+    if !st.initialized || !st.hci_up || st.connected_index.is_none() || st.acl_handle == 0 {
+        return;
+    }
+
+    unsafe {
+        // 1. Non-blockingly drain UART0 RX FIFO if any bytes have arrived from the controller/speaker
+        let mut rx_pkt = [0u8; 260];
+        let mut rx_guard = 4u8;
+        while rx_guard > 0 && (mmio::read(UART_FR) & FR_RXFE) == 0 {
+            rx_guard -= 1;
+            let Some((pkt_type, evt_or_pb, plen)) = hci_read_packet(&mut rx_pkt, 6) else {
+                break;
+            };
+            if pkt_type == 0x04 {
+                if evt_or_pb == 0x05 && plen >= 4 {
+                    // HCI Disconnection Complete (0x05)
+                    STATE.with(|s| {
+                        for d in s.devices.iter_mut() {
+                            d.connected = false;
+                        }
+                        s.connected_index = None;
+                        s.acl_handle = 0;
+                        s.a2dp_ready = false;
+                        s.avdtp_streaming = false;
+                    });
+                    return;
+                }
+            } else if pkt_type == 0x02 && plen >= 4 {
+                // Handle runtime L2CAP Echo / Config / AVDTP / AVRCP commands from speaker
+                let mut cs = ClassicConnState::new();
+                cs.avdtp_sig_dcid = st.avdtp_sig_dcid;
+                cs.avdtp_media_dcid = st.avdtp_media_dcid;
+                cs.acp_seid_shifted = st.acp_seid_shifted;
+                cs.sbc_cap0 = st.sbc_cap0;
+                cs.sbc_cap1 = st.sbc_cap1;
+                cs.sbc_bitpool = st.sbc_bitpool;
+                cs.avdtp_streaming = st.avdtp_streaming;
+                cs.a2dp_ready = st.a2dp_ready;
+                handle_acl_l2cap_packet(st.acl_handle, &rx_pkt[..plen], &mut cs);
+                if cs.avdtp_streaming != st.avdtp_streaming {
+                    STATE.with(|s| s.avdtp_streaming = cs.avdtp_streaming);
+                }
+            }
+        }
+
+        if !st.a2dp_ready || !st.a2dp_playing || st.avdtp_media_dcid == 0 {
+            return;
+        }
+
+        // 2. Ensure AVDTP stream is in STREAMING state (`AVDTP_START = 0x07`)
+        if !st.avdtp_streaming && st.avdtp_sig_dcid != 0 {
+            let start_cmd: [u8; 3] = [0x50, 0x07, st.acp_seid_shifted];
+            let _ = hci_send_l2cap(st.acl_handle, st.avdtp_sig_dcid, &start_cmd);
+            STATE.with(|s| s.avdtp_streaming = true);
+        }
+
+        // 3. Hardware-timer-paced RTP + SBC media packet transmission (5 SBC frames = 640 samples/pkt)
+        const FRAMES_PER_PKT: usize = 5;
+        let sample_rate: u64 = if (st.sbc_cap0 & 0x80) != 0 {
+            16_000
+        } else if (st.sbc_cap0 & 0x40) != 0 {
+            32_000
+        } else if (st.sbc_cap0 & 0x10) != 0 {
+            48_000
+        } else {
+            44_100
+        };
+        let freq = timer::frequency();
+        let pkt_samples = (FRAMES_PER_PKT * 128) as u64; // 640 samples (~14.51 ms at 44.1 kHz)
+        let pkt_ticks = (freq * pkt_samples) / sample_rate;
+        let lead_ticks = (freq * 60) / 1000; // Keep ~60 ms pre-buffer cushion in speaker
+
+        let now = timer::counter();
+        if A2DP_NEXT_TICK == 0 || now > A2DP_NEXT_TICK + (freq / 4) {
+            A2DP_NEXT_TICK = now.saturating_sub(pkt_ticks);
+        }
+
+        let mut sent_this_turn = 0u8;
+        while A2DP_NEXT_TICK <= now + lead_ticks && sent_this_turn < 3 {
+            let seq = A2DP_SEQ;
+            let ts = A2DP_TS;
+            A2DP_SEQ = A2DP_SEQ.wrapping_add(1);
+            A2DP_TS = A2DP_TS.wrapping_add(pkt_samples as u32);
+            A2DP_NEXT_TICK += pkt_ticks;
+            sent_this_turn += 1;
+
+            let mut media_pkt = [0u8; 440];
+            // 12-byte RTP Header (V=2, PT=96 dynamic A2DP payload, SSRC=0x00000001)
+            media_pkt[0] = 0x80;
+            media_pkt[1] = 0x60;
+            media_pkt[2] = (seq >> 8) as u8;
+            media_pkt[3] = (seq & 0xFF) as u8;
+            media_pkt[4] = (ts >> 24) as u8;
+            media_pkt[5] = (ts >> 16) as u8;
+            media_pkt[6] = (ts >> 8) as u8;
+            media_pkt[7] = (ts & 0xFF) as u8;
+            media_pkt[8] = 0x00;
+            media_pkt[9] = 0x00;
+            media_pkt[10] = 0x00;
+            media_pkt[11] = 0x01;
+            // 1-byte A2DP SBC Media Payload Header (`num_frames = 5`)
+            media_pkt[12] = FRAMES_PER_PKT as u8;
+
+            let mut off = 13usize;
+            let mut cur = A2DP_SAMPLE_CURSOR;
+            for _ in 0..FRAMES_PER_PKT {
+                let flen = encode_sbc_frame(
+                    st.sbc_cap0,
+                    st.sbc_cap1,
+                    st.sbc_bitpool.clamp(2, 53),
+                    st.a2dp_track,
+                    &mut cur,
+                    &mut media_pkt[off..],
+                );
+                off += flen;
+            }
+            A2DP_SAMPLE_CURSOR = cur;
+
+            let _ = hci_send_l2cap(st.acl_handle, st.avdtp_media_dcid, &media_pkt[..off]);
+            STATE.with(|s| s.a2dp_packets_sent = s.a2dp_packets_sent.wrapping_add(1));
+        }
     }
 }
 

@@ -96,6 +96,11 @@ impl MusicApp {
         self.current_track = 0;
         self.play_pos_sec = 0;
         self.playing = true;
+        bluetooth::set_a2dp_playback(self.playing, self.current_track, self.play_pos_sec);
+    }
+
+    pub fn sync_a2dp_state(&self) {
+        bluetooth::set_a2dp_playback(self.playing, self.current_track, self.play_pos_sec);
     }
 
     pub fn is_playing(&self) -> bool {
@@ -188,7 +193,11 @@ impl App for MusicApp {
         }
 
         // Format + 14-Band Real-Time Spectrum Analyzer
-        canvas.draw_str_ascii(74, 54, track.format_info, colors::rgb(150, 180, 220));
+        if bt.a2dp_ready && bt.connected_index.is_some() {
+            canvas.draw_str_ascii(74, 54, "SBC 44.1k", colors::rgb(80, 245, 165));
+        } else {
+            canvas.draw_str_ascii(74, 54, track.format_info, colors::rgb(150, 180, 220));
+        }
         let base_bars: [i32; 14] = [6, 12, 18, 15, 20, 13, 10, 17, 19, 14, 11, 16, 10, 7];
         for (idx, &base_h) in base_bars.iter().enumerate() {
             let bh = if self.playing {
@@ -292,17 +301,20 @@ impl App for MusicApp {
                 self.current_track =
                     (self.current_track + self.tracks.len() - 1) % self.tracks.len();
                 self.play_pos_sec = 0;
+                bluetooth::set_a2dp_playback(self.playing, self.current_track, self.play_pos_sec);
                 AppIntent::None
             }
             1 => {
                 // 2.播放 / 暂停
                 self.playing = !self.playing;
+                bluetooth::set_a2dp_playback(self.playing, self.current_track, self.play_pos_sec);
                 AppIntent::None
             }
             2 => {
                 // 3.下一曲
                 self.current_track = (self.current_track + 1) % self.tracks.len();
                 self.play_pos_sec = 0;
+                bluetooth::set_a2dp_playback(self.playing, self.current_track, self.play_pos_sec);
                 AppIntent::None
             }
             _ => {
@@ -318,6 +330,7 @@ impl App for MusicApp {
             let dur = self.tracks[self.current_track].duration_sec.max(1);
             let ratio = (tx - 58).clamp(0, 198) as u32;
             self.play_pos_sec = (dur * ratio) / 198;
+            bluetooth::seek_a2dp_playback(self.play_pos_sec);
             return AppIntent::None;
         }
         // Bottom 4 transport buttons (y = 200..238)

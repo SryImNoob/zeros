@@ -95,6 +95,10 @@ impl DesktopShell {
                 self.needs_full_redraw = true;
                 self.render();
                 let ok = bluetooth::connect_device(idx);
+                if ok {
+                    self.music_app.sync_a2dp_state();
+                    bluetooth::pump_a2dp_audio();
+                }
                 self.media_bt_app.on_connect_finished(idx, ok);
                 self.needs_full_redraw = true;
             }
@@ -305,6 +309,8 @@ pub fn ui_task() {
         if !crate::bsp::is_qemu() {
             tryboot::watchdog_feed(15);
         }
+        bluetooth::pump_a2dp_audio();
+
         if let Some((tx, ty)) = touch::poll_touch() {
             input::push_event(InputEvent::Touch(tx, ty));
         }
@@ -314,11 +320,12 @@ pub fn ui_task() {
         }
 
         shell.render();
+        bluetooth::pump_a2dp_audio();
 
-        task::sleep_ms(40);
+        task::sleep_ms(10);
         sub_tick = sub_tick.wrapping_add(1);
-        if sub_tick % 5 == 0 {
-            shell.tick_200ms(sub_tick / 5);
+        if sub_tick % 20 == 0 {
+            shell.tick_200ms(sub_tick / 20);
         }
     }
 }

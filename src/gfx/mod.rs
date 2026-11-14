@@ -246,14 +246,24 @@ impl Canvas {
         self.dirty_y1 = SCREEN_H;
     }
 
-    /// Flush only the accumulated dirty rectangle to the physical display in a single SPI burst.
+    /// Flush only the accumulated dirty rectangle to the physical display, slicing tall regions
+    /// into 48-row bands so real-time Bluetooth A2DP SBC audio streaming never underruns during SPI blits.
     pub fn flush(&mut self) {
         if self.dirty_x0 < self.dirty_x1 && self.dirty_y0 < self.dirty_y1 {
             let x = self.dirty_x0 as u32;
-            let y = self.dirty_y0 as u32;
+            let y0 = self.dirty_y0 as u32;
+            let y1 = self.dirty_y1 as u32;
             let w = (self.dirty_x1 - self.dirty_x0) as u32;
-            let h = (self.dirty_y1 - self.dirty_y0) as u32;
-            display::blit_rect(x, y, w, h, &self.pixels, SCREEN_W as u32);
+
+            let mut cur_y = y0;
+            while cur_y < y1 {
+                crate::drivers::bluetooth::pump_a2dp_audio();
+                let band_h = (y1 - cur_y).min(48);
+                display::blit_rect(x, cur_y, w, band_h, &self.pixels, SCREEN_W as u32);
+                cur_y += band_h;
+            }
+            crate::drivers::bluetooth::pump_a2dp_audio();
+
             self.dirty_x0 = SCREEN_W;
             self.dirty_y0 = SCREEN_H;
             self.dirty_x1 = 0;
