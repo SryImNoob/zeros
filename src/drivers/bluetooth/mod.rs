@@ -19,12 +19,17 @@
 
 #![allow(dead_code)]
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::arch::timer;
 use crate::bsp;
 use crate::drivers::{mmio, uart};
 use crate::fs::fat32;
 use crate::kernel::tryboot;
 use crate::sync::IrqSafeLock;
+
+static BT_CMD_ACTIVE: AtomicBool = AtomicBool::new(false);
+static A2DP_PUMP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 // ─── PL011 UART0 Registers (Base: 0x3F20_1000) ───
 const UART_DR: usize = mmio::UART0_BASE + 0x00;
@@ -379,9 +384,16 @@ unsafe fn hci_send_l2cap(handle: u16, cid: u16, l2cap_payload: &[u8]) -> bool {
             return false;
         }
     }
-    for &b in l2cap_payload {
+    for (idx, &b) in l2cap_payload.iter().enumerate() {
         if !uart0_putc(b) {
             return false;
+        }
+        if (idx & 0x0F) == 0x0F {
+            let mut guard = 8_000u32;
+            while (mmio::read(UART_FR) & (1 << 3)) != 0 && guard > 0 {
+                guard -= 1;
+                core::hint::spin_loop();
+            }
         }
     }
     true
@@ -890,6 +902,8 @@ pub fn scan_devices() -> usize {
         init();
     }
 
+    BT_CMD_ACTIVE.store(true, Ordering::SeqCst);
+
     let mut list = [BtDeviceInfo::empty(); MAX_DISCOVERED_DEVICES];
     let mut count = 0usize;
 
@@ -1345,7 +1359,10 @@ pub fn scan_devices() -> usize {
         s.devices = list;
         s.device_count = count;
         s.connected_index = None;
+        s.a2dp_ready = false;
+        s.avdtp_streaming = false;
     });
+    BT_CMD_ACTIVE.store(false, Ordering::SeqCst);
 
     count
 }
@@ -2002,6 +2019,8 @@ pub fn connect_device(idx: usize) -> bool {
     }
 
     let mut dev = st.devices[idx];
+
+    BT_CMD_ACTIVE.store(true, Ordering::SeqCst);
 
     let mut connected_handle: Option<u16> = None;
     let mut a2dp_ready = false;
@@ -2779,12 +2798,24 @@ pub fn connect_device(idx: usize) -> bool {
         });
         unsafe {
             A2DP_NEXT_TICK = 0;
+            RUNTIME_CS = ClassicConnState::new();
+            RUNTIME_CS.avdtp_sig_dcid = saved_sig_dcid;
+            RUNTIME_CS.avdtp_media_dcid = saved_media_dcid;
+            RUNTIME_CS.acp_seid_shifted = saved_acp_seid;
+            RUNTIME_CS.sbc_cap0 = saved_sbc_cap0;
+            RUNTIME_CS.sbc_cap1 = saved_sbc_cap1;
+            RUNTIME_CS.sbc_bitpool = saved_sbc_bp;
+            RUNTIME_CS.avdtp_streaming = saved_streaming;
+            RUNTIME_CS.a2dp_ready = a2dp_ready;
+            RUNTIME_REASM = AclReassembler::new();
         }
+        BT_CMD_ACTIVE.store(false, Ordering::SeqCst);
         true
     } else {
         STATE.with(|s| {
             s.last_conn_err = last_err;
         });
+        BT_CMD_ACTIVE.store(false, Ordering::SeqCst);
         false
     }
 }
@@ -2795,6 +2826,11 @@ static mut A2DP_SEQ: u16 = 1;
 static mut A2DP_TS: u32 = 0;
 static mut A2DP_SAMPLE_CURSOR: u32 = 0;
 static mut A2DP_NEXT_TICK: u64 = 0;
+static mut A2DP_PHASE_MEL: u32 = 0;
+static mut A2DP_PHASE_CHD: u32 = 0;
+static mut A2DP_PHASE_BAS: u32 = 0;
+static mut RUNTIME_CS: ClassicConnState = ClassicConnState::new();
+static mut RUNTIME_REASM: AclReassembler = AclReassembler::new();
 
 /// Synchronize the `1.听歌` (`MusicApp`) playback state with the Bluetooth A2DP SBC audio streamer.
 pub fn set_a2dp_playback(playing: bool, track_idx: usize, pos_sec: u32) {
@@ -2806,7 +2842,9 @@ pub fn set_a2dp_playback(playing: bool, track_idx: usize, pos_sec: u32) {
         if track_changed || resumed {
             unsafe {
                 A2DP_SAMPLE_CURSOR = pos_sec.wrapping_mul(44_100);
-                A2DP_NEXT_TICK = 0;
+                if resumed {
+                    A2DP_NEXT_TICK = 0;
+                }
             }
         }
     });
@@ -3014,8 +3052,8 @@ fn sbc_calculate_bits(
                 }
             }
         }
-        for ch in 0..2 {
-            for sb in 0..8 {
+        for sb in 0..8 {
+            for ch in 0..2 {
                 if bitcount >= bp {
                     break;
                 }
@@ -3028,12 +3066,12 @@ fn sbc_calculate_bits(
                 }
             }
         }
-        for ch in 0..2 {
-            for sb in 0..8 {
+        for sb in 0..8 {
+            for ch in 0..2 {
                 if bitcount >= bp {
                     break;
                 }
-                if bits[ch][sb] < 16 {
+                if bits[ch][sb] >= 2 && bits[ch][sb] < 16 {
                     bits[ch][sb] += 1;
                     bitcount += 1;
                 }
@@ -3043,8 +3081,11 @@ fn sbc_calculate_bits(
 }
 
 /// Encode a single 16-block, 8-subband Bluetooth A2DP SBC frame (`72` bytes in Stereo, `73` in Joint Stereo)
-/// containing synthesized polyphonic stereo audio for Track 0 (`七里香 - 周杰伦`) or Track 1 (`夜曲 - 周杰伦`).
-fn encode_sbc_frame(
+/// containing phase-continuous polyphonic stereo audio for:
+///   - Track 0: 《七里香 - 周杰伦》 (warm C-major ballad chorus)
+///   - Track 1: 《夜曲 - 周杰伦》 (rhythmic A-minor nocturne arpeggio + rap melody)
+///   - Track 2: 《青花瓷 - 周杰伦》 (bright high-register pentatonic Guzheng/flute melody)
+unsafe fn encode_sbc_frame(
     sbc_cap0: u8,
     sbc_cap1: u8,
     bitpool: u8,
@@ -3052,9 +3093,7 @@ fn encode_sbc_frame(
     sample_cursor: &mut u32,
     out: &mut [u8],
 ) -> usize {
-    // 32-step recognizable melody + chord accompaniment + bassline for:
-    //   - Track 0: 《七里香 - 周杰伦》 ("雨下整夜 我的爱溢出就像雨水 / 院子落叶 跟我的思念厚厚一叠...")
-    //   - Track 1: 《夜曲 - 周杰伦》 ("为你弹奏肖邦的夜曲 纪念我死去的爱情...")
+    // Track 0: 《七里香 - 周杰伦》 ("雨下整夜 我的爱溢出就像雨水 / 院子落叶 跟我的思念厚厚一叠...")
     const QILIXIANG_MELODY: [u16; 32] = [
         659, 784, 784, 659, 587, 659, 784, 587, // E5 G5 G5 E5 | D5 E5 G5 D5
         523, 440, 392, 392, 523, 587, 659, 659, // C5 A4 G4 G4 | C5 D5 E5 E5
@@ -3074,11 +3113,12 @@ fn encode_sbc_frame(
         147, 147, 196, 196, 196, 131, 196, 262, // D3  G3  G3  C4
     ];
 
+    // Track 1: 《夜曲 - 周杰伦》 (distinct lower A-minor acoustic guitar arpeggio + rhythmic chorus)
     const YEQU_MELODY: [u16; 32] = [
-        659, 659, 659, 523, 494, 440, 494, 523, // E5 E5 E5 C5 | B4 A4 B4 C5
-        587, 587, 587, 494, 440, 392, 440, 494, // D5 D5 D5 B4 | A4 G4 A4 B4
-        523, 523, 523, 440, 392, 349, 392, 440, // C5 C5 C5 A4 | G4 F4 G4 A4
-        494, 523, 494, 392, 440, 440, 330, 440, // B4 C5 B4 G4 | A4 A4 E4 A4
+        440, 523, 659, 880, 784, 659, 523, 494, // A4 C5 E5 A5 | G5 E5 C5 B4
+        440, 494, 523, 659, 587, 523, 494, 392, // A4 B4 C5 E5 | D5 C5 B4 G4
+        349, 440, 523, 698, 659, 523, 440, 392, // F4 A4 C5 F5 | E5 C5 A4 G4
+        330, 415, 494, 659, 587, 523, 494, 440, // E4 G#4 B4 E5 | D5 C5 B4 A4
     ];
     const YEQU_CHORD: [u16; 32] = [
         330, 440, 330, 440, 294, 392, 294, 392, // Am / Em
@@ -3091,6 +3131,26 @@ fn encode_sbc_frame(
         175, 175, 175, 175, 131, 131, 131, 131, // F3 / C3
         147, 147, 147, 147, 220, 220, 220, 220, // D3 / A3
         165, 165, 165, 165, 220, 220, 220, 220, // E3 / A3
+    ];
+
+    // Track 2: 《青花瓷 - 周杰伦》 ("天青色等烟雨 而我在等你 / 炊烟袅袅升起 隔江千万里...")
+    const QINGHUACI_MELODY: [u16; 32] = [
+        880, 784, 659, 587, 523, 587, 659, 784, // A5 G5 E5 D5 | C5 D5 E5 G5
+        659, 587, 523, 440, 392, 440, 523, 523, // E5 D5 C5 A4 | G4 A4 C5 C5
+        587, 659, 784, 880, 784, 659, 587, 523, // D5 E5 G5 A5 | G5 E5 D5 C5
+        587, 659, 523, 440, 392, 440, 523, 523, // D5 E5 C5 A4 | G4 A4 C5 C5
+    ];
+    const QINGHUACI_CHORD: [u16; 32] = [
+        523, 523, 392, 392, 440, 440, 330, 330, // C5  G4  A4  E4
+        349, 349, 392, 392, 523, 523, 392, 392, // F4  G4  C5  G4
+        349, 349, 392, 392, 330, 330, 440, 440, // F4  G4  E4  A4
+        294, 294, 392, 392, 523, 523, 523, 523, // D4  G4  C5  C5
+    ];
+    const QINGHUACI_BASS: [u16; 32] = [
+        262, 262, 196, 196, 220, 220, 165, 165, // C4  G3  A3  E3
+        175, 175, 196, 196, 262, 262, 196, 196, // F3  G3  C4  G3
+        175, 175, 196, 196, 165, 165, 220, 220, // F3  G3  E3  A3
+        147, 147, 196, 196, 262, 262, 262, 262, // D3  G3  C4  C4
     ];
 
     let (freq_idx, sample_rate) = if (sbc_cap0 & 0x80) != 0 {
@@ -3107,10 +3167,14 @@ fn encode_sbc_frame(
     let num_ch = if ch_mode == 0x08 { 1usize } else { 2usize };
     let alloc_snr = (sbc_cap1 & 0x02) != 0;
 
-    // Synthesize 16 subband blocks (`16 * 8 = 128` PCM samples per SBC frame)
-    // Subband 0 (`0 .. 2756 Hz` at 44.1 kHz) carries the fundamental + 2nd harmonic at full 16-bit resolution.
+    // Synthesize 16 subband blocks (`16 * 8 = 128` PCM samples per SBC frame) using continuous Q24 phase accumulators
     let mut sb_samples = [[[0i32; 8]; 2]; 16];
-    let step_samples = 14_336u32; // ~0.325s per eighth-note step at 44.1 kHz
+    let step_samples: u32 = match track_idx {
+        0 => 14_336, // ~0.325s/note (ballad tempo for 七里香)
+        1 => 10_240, // ~0.232s/note (fast rhythmic tempo for 夜曲)
+        _ => 12_288, // ~0.278s/note (flowing tempo for 青花瓷)
+    };
+    let sr = sample_rate as u64;
 
     for blk in 0..16 {
         let s_idx = *sample_cursor;
@@ -3119,43 +3183,51 @@ fn encode_sbc_frame(
         let note_step = ((s_idx / step_samples) as usize) & 31;
         let note_pos = s_idx % step_samples;
 
-        let (f_mel, f_chd, f_bas) = if track_idx == 0 {
-            (
+        let (f_mel, f_chd, f_bas) = match track_idx {
+            0 => (
                 QILIXIANG_MELODY[note_step] as u64,
                 QILIXIANG_CHORD[note_step] as u64,
                 QILIXIANG_BASS[note_step] as u64,
-            )
-        } else {
-            (
+            ),
+            1 => (
                 YEQU_MELODY[note_step] as u64,
                 YEQU_CHORD[note_step] as u64,
                 YEQU_BASS[note_step] as u64,
-            )
+            ),
+            _ => (
+                QINGHUACI_MELODY[note_step] as u64,
+                QINGHUACI_CHORD[note_step] as u64,
+                QINGHUACI_BASS[note_step] as u64,
+            ),
         };
 
-        // Smooth electric-piano ADSR envelope (soft 8ms attack + natural exponential decay)
+        // Smooth electric-piano ADSR envelope (soft 8ms attack + natural decay)
         let env: i32 = if note_pos < 360 {
             ((note_pos * 256) / 360) as i32
         } else {
-            let decay = ((note_pos - 360) * 165) / step_samples;
-            (256i32 - decay as i32).max(75)
+            let decay = ((note_pos - 360) * 145) / step_samples;
+            (256i32 - decay as i32).max(95)
         };
 
-        // Compute continuous phase (`0..255`) for melody, 2nd harmonic, chord, and bass
-        let sr = sample_rate as u64;
-        let p_mel = (((s_idx as u64) * f_mel * 256) / sr) as u8;
-        let p_mel2 = p_mel.wrapping_mul(2);
-        let p_chd = (((s_idx as u64) * f_chd * 256) / sr) as u8;
-        let p_bas = (((s_idx as u64) * f_bas * 256) / sr) as u8;
+        // Advance continuous Q24 phase accumulators (`8` PCM samples per SBC block) so note changes NEVER click/pop!
+        A2DP_PHASE_MEL =
+            A2DP_PHASE_MEL.wrapping_add(((f_mel * 8 * (1 << 24)) / sr) as u32);
+        A2DP_PHASE_CHD =
+            A2DP_PHASE_CHD.wrapping_add(((f_chd * 8 * (1 << 24)) / sr) as u32);
+        A2DP_PHASE_BAS =
+            A2DP_PHASE_BAS.wrapping_add(((f_bas * 8 * (1 << 24)) / sr) as u32);
 
-        // Warm electric-piano / music-box timbre: fundamental + 2nd harmonic + chord + bass
+        let p_mel = (A2DP_PHASE_MEL >> 16) as u8;
+        let p_mel2 = p_mel.wrapping_mul(2);
+        let p_chd = (A2DP_PHASE_CHD >> 16) as u8;
+        let p_bas = (A2DP_PHASE_BAS >> 16) as u8;
+
         let mel_wave = (fast_sin(p_mel) * 5 + fast_sin(p_mel2) * 2) * env / (7 * 256);
         let chd_wave = (fast_sin(p_chd) * (env + 128)) / 512;
         let bas_wave = fast_sin(p_bas);
 
-        // Stereo mix (`[-6800 .. +6800]`, fits comfortably in `scale_factor = 12` -> `[-8192 .. +8192]`)
-        let left_sb0 = (mel_wave * 4 + chd_wave * 2 + bas_wave * 2).clamp(-7600, 7600);
-        let right_sb0 = (mel_wave * 4 + chd_wave * 3 + bas_wave).clamp(-7600, 7600);
+        let left_sb0 = (mel_wave * 4 + chd_wave * 2 + bas_wave * 2).clamp(-7500, 7500);
+        let right_sb0 = (mel_wave * 4 + chd_wave * 3 + bas_wave).clamp(-7500, 7500);
 
         sb_samples[blk][0][0] = left_sb0;
         sb_samples[blk][1][0] = right_sb0;
@@ -3253,30 +3325,60 @@ fn encode_sbc_frame(
     pos
 }
 
-/// Non-blockingly drain any incoming HCI Events (`0x04`) or ACL packets (`0x02`) on `UART0`
-/// and transmit hardware-timer-paced RTP + A2DP SBC audio frames (`5` frames/pkt = `640` samples = `14.51 ms`)
-/// to the connected Bluetooth speaker (`SRS-XB100`).
-pub fn pump_a2dp_audio() {
-    if bsp::is_qemu() {
-        return;
+/// Read a single byte from `UART0` within `timeout_us` microseconds (`150 µs` = `0.15 ms` max wait).
+/// At `921,600` baud, consecutive bytes inside an H4 packet arrive every `10.85 µs`, so we NEVER block
+/// for `40 ms` if an H4 packet is truncated!
+#[inline]
+unsafe fn uart0_getc_us(timeout_us: u64) -> Option<u8> {
+    if (mmio::read(UART_FR) & FR_RXFE) == 0 {
+        return Some((mmio::read(UART_DR) & 0xFF) as u8);
     }
-
-    let st = status();
-    if !st.initialized || !st.hci_up || st.connected_index.is_none() || st.acl_handle == 0 {
-        return;
+    let freq = timer::frequency();
+    let deadline = timer::counter() + ((freq * timeout_us) / 1_000_000).max(2);
+    loop {
+        if (mmio::read(UART_FR) & FR_RXFE) == 0 {
+            return Some((mmio::read(UART_DR) & 0xFF) as u8);
+        }
+        if timer::counter() >= deadline {
+            return None;
+        }
+        core::hint::spin_loop();
     }
+}
 
-    unsafe {
-        // 1. Non-blockingly drain UART0 RX FIFO if any bytes have arrived from the controller/speaker
-        let mut rx_pkt = [0u8; 260];
-        let mut rx_guard = 4u8;
-        while rx_guard > 0 && (mmio::read(UART_FR) & FR_RXFE) == 0 {
-            rx_guard -= 1;
-            let Some((pkt_type, evt_or_pb, plen)) = hci_read_packet(&mut rx_pkt, 6) else {
-                break;
-            };
-            if pkt_type == 0x04 {
-                if evt_or_pb == 0x05 && plen >= 4 {
+/// Fast non-blocking `UART0` RX drainer for active A2DP streaming (`< 0.15 ms` max latency).
+/// Consumes `0x13 (Number_Of_Completed_Packets)` events and dispatches incoming AVRCP/AVDTP L2CAP packets.
+unsafe fn poll_a2dp_rx_fast(acl_handle: u16) -> bool {
+    let mut rx_pkt = [0u8; 260];
+    let mut guard = 8u8;
+
+    while guard > 0 && (mmio::read(UART_FR) & FR_RXFE) == 0 {
+        guard -= 1;
+        let pkt_type = (mmio::read(UART_DR) & 0xFF) as u8;
+        match pkt_type {
+            0x04 => {
+                let Some(evt_code) = uart0_getc_us(150) else {
+                    break;
+                };
+                let Some(plen_u8) = uart0_getc_us(150) else {
+                    break;
+                };
+                let plen = plen_u8 as usize;
+                let mut ok = true;
+                for i in 0..plen {
+                    if let Some(b) = uart0_getc_us(150) {
+                        if i < rx_pkt.len() {
+                            rx_pkt[i] = b;
+                        }
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if !ok {
+                    break;
+                }
+                if evt_code == 0x05 && plen >= 4 {
                     // HCI Disconnection Complete (0x05)
                     STATE.with(|s| {
                         for d in s.devices.iter_mut() {
@@ -3287,102 +3389,170 @@ pub fn pump_a2dp_audio() {
                         s.a2dp_ready = false;
                         s.avdtp_streaming = false;
                     });
-                    return;
-                }
-            } else if pkt_type == 0x02 && plen >= 4 {
-                // Handle runtime L2CAP Echo / Config / AVDTP / AVRCP commands from speaker
-                let mut cs = ClassicConnState::new();
-                cs.avdtp_sig_dcid = st.avdtp_sig_dcid;
-                cs.avdtp_media_dcid = st.avdtp_media_dcid;
-                cs.acp_seid_shifted = st.acp_seid_shifted;
-                cs.sbc_cap0 = st.sbc_cap0;
-                cs.sbc_cap1 = st.sbc_cap1;
-                cs.sbc_bitpool = st.sbc_bitpool;
-                cs.avdtp_streaming = st.avdtp_streaming;
-                cs.a2dp_ready = st.a2dp_ready;
-                handle_acl_l2cap_packet(st.acl_handle, &rx_pkt[..plen], &mut cs);
-                if cs.avdtp_streaming != st.avdtp_streaming {
-                    STATE.with(|s| s.avdtp_streaming = cs.avdtp_streaming);
+                    return false;
                 }
             }
-        }
-
-        if !st.a2dp_ready || !st.a2dp_playing || st.avdtp_media_dcid == 0 {
-            return;
-        }
-
-        // 2. Ensure AVDTP stream is in STREAMING state (`AVDTP_START = 0x07`)
-        if !st.avdtp_streaming && st.avdtp_sig_dcid != 0 {
-            let start_cmd: [u8; 3] = [0x50, 0x07, st.acp_seid_shifted];
-            let _ = hci_send_l2cap(st.acl_handle, st.avdtp_sig_dcid, &start_cmd);
-            STATE.with(|s| s.avdtp_streaming = true);
-        }
-
-        // 3. Hardware-timer-paced RTP + SBC media packet transmission (5 SBC frames = 640 samples/pkt)
-        const FRAMES_PER_PKT: usize = 5;
-        let sample_rate: u64 = if (st.sbc_cap0 & 0x80) != 0 {
-            16_000
-        } else if (st.sbc_cap0 & 0x40) != 0 {
-            32_000
-        } else if (st.sbc_cap0 & 0x10) != 0 {
-            48_000
-        } else {
-            44_100
-        };
-        let freq = timer::frequency();
-        let pkt_samples = (FRAMES_PER_PKT * 128) as u64; // 640 samples (~14.51 ms at 44.1 kHz)
-        let pkt_ticks = (freq * pkt_samples) / sample_rate;
-        let lead_ticks = (freq * 60) / 1000; // Keep ~60 ms pre-buffer cushion in speaker
-
-        let now = timer::counter();
-        if A2DP_NEXT_TICK == 0 || now > A2DP_NEXT_TICK + (freq / 4) {
-            A2DP_NEXT_TICK = now.saturating_sub(pkt_ticks);
-        }
-
-        let mut sent_this_turn = 0u8;
-        while A2DP_NEXT_TICK <= now + lead_ticks && sent_this_turn < 3 {
-            let seq = A2DP_SEQ;
-            let ts = A2DP_TS;
-            A2DP_SEQ = A2DP_SEQ.wrapping_add(1);
-            A2DP_TS = A2DP_TS.wrapping_add(pkt_samples as u32);
-            A2DP_NEXT_TICK += pkt_ticks;
-            sent_this_turn += 1;
-
-            let mut media_pkt = [0u8; 440];
-            // 12-byte RTP Header (V=2, PT=96 dynamic A2DP payload, SSRC=0x00000001)
-            media_pkt[0] = 0x80;
-            media_pkt[1] = 0x60;
-            media_pkt[2] = (seq >> 8) as u8;
-            media_pkt[3] = (seq & 0xFF) as u8;
-            media_pkt[4] = (ts >> 24) as u8;
-            media_pkt[5] = (ts >> 16) as u8;
-            media_pkt[6] = (ts >> 8) as u8;
-            media_pkt[7] = (ts & 0xFF) as u8;
-            media_pkt[8] = 0x00;
-            media_pkt[9] = 0x00;
-            media_pkt[10] = 0x00;
-            media_pkt[11] = 0x01;
-            // 1-byte A2DP SBC Media Payload Header (`num_frames = 5`)
-            media_pkt[12] = FRAMES_PER_PKT as u8;
-
-            let mut off = 13usize;
-            let mut cur = A2DP_SAMPLE_CURSOR;
-            for _ in 0..FRAMES_PER_PKT {
-                let flen = encode_sbc_frame(
-                    st.sbc_cap0,
-                    st.sbc_cap1,
-                    st.sbc_bitpool.clamp(2, 53),
-                    st.a2dp_track,
-                    &mut cur,
-                    &mut media_pkt[off..],
-                );
-                off += flen;
+            0x02 => {
+                let (Some(_h_lo), Some(h_hi), Some(dlen_lo), Some(dlen_hi)) = (
+                    uart0_getc_us(150),
+                    uart0_getc_us(150),
+                    uart0_getc_us(150),
+                    uart0_getc_us(150),
+                ) else {
+                    break;
+                };
+                let pb_flag = (h_hi >> 4) & 0x03;
+                let dlen = u16::from_le_bytes([dlen_lo, dlen_hi]) as usize;
+                if dlen > 256 {
+                    // Framing desync recovery: drain FIFO immediately without blocking
+                    while (mmio::read(UART_FR) & FR_RXFE) == 0 {
+                        let _ = mmio::read(UART_DR);
+                    }
+                    break;
+                }
+                let mut ok = true;
+                for i in 0..dlen {
+                    if let Some(b) = uart0_getc_us(150) {
+                        rx_pkt[i] = b;
+                    } else {
+                        ok = false;
+                        break;
+                    }
+                }
+                if ok && dlen > 0 {
+                    let cs_ptr = &raw mut RUNTIME_CS;
+                    let reasm_ptr = &raw mut RUNTIME_REASM;
+                    let prev_stream = (*cs_ptr).avdtp_streaming;
+                    (*reasm_ptr).feed_and_dispatch(
+                        acl_handle,
+                        pb_flag,
+                        &rx_pkt[..dlen],
+                        &mut *cs_ptr,
+                    );
+                    if (*cs_ptr).avdtp_streaming != prev_stream {
+                        let new_stream = (*cs_ptr).avdtp_streaming;
+                        STATE.with(|s| s.avdtp_streaming = new_stream);
+                    }
+                }
             }
-            A2DP_SAMPLE_CURSOR = cur;
-
-            let _ = hci_send_l2cap(st.acl_handle, st.avdtp_media_dcid, &media_pkt[..off]);
-            STATE.with(|s| s.a2dp_packets_sent = s.a2dp_packets_sent.wrapping_add(1));
+            _ => {}
         }
+    }
+    true
+}
+
+/// Non-blockingly drain any incoming HCI Events (`0x04`) or ACL packets (`0x02`) on `UART0`
+/// and transmit hardware-timer-paced RTP + A2DP SBC audio frames (`5` frames/pkt = `640` samples = `14.51 ms`)
+/// to the connected Bluetooth speaker (`SRS-XB100`).
+///
+/// Safe to call from both `timer::handle_irq()` (`100Hz` hardware timer IRQ) and `ui_task()`.
+pub fn pump_a2dp_audio() {
+    if bsp::is_qemu() || BT_CMD_ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+
+    if A2DP_PUMP_ACTIVE
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+
+    unsafe {
+        pump_a2dp_audio_inner();
+    }
+
+    A2DP_PUMP_ACTIVE.store(false, Ordering::Release);
+}
+
+unsafe fn pump_a2dp_audio_inner() {
+    let st = status();
+    if !st.initialized || !st.hci_up || st.connected_index.is_none() || st.acl_handle == 0 {
+        return;
+    }
+
+    // 1. Ultra-fast non-blocking UART0 RX drain (`< 0.15 ms` max)
+    if !poll_a2dp_rx_fast(st.acl_handle) {
+        return;
+    }
+
+    if !st.a2dp_ready || !st.a2dp_playing || st.avdtp_media_dcid == 0 {
+        return;
+    }
+
+    // 2. Ensure AVDTP stream is in STREAMING state (`AVDTP_START = 0x07`)
+    if !st.avdtp_streaming && st.avdtp_sig_dcid != 0 {
+        let start_cmd: [u8; 3] = [0x50, 0x07, st.acp_seid_shifted];
+        let _ = hci_send_l2cap(st.acl_handle, st.avdtp_sig_dcid, &start_cmd);
+        RUNTIME_CS.avdtp_streaming = true;
+        STATE.with(|s| s.avdtp_streaming = true);
+    }
+
+    // 3. Hardware-timer-paced RTP + SBC media packet transmission (`5` SBC frames = `640` samples = `14.51 ms`)
+    const FRAMES_PER_PKT: usize = 5;
+    let sample_rate: u64 = if (st.sbc_cap0 & 0x80) != 0 {
+        16_000
+    } else if (st.sbc_cap0 & 0x40) != 0 {
+        32_000
+    } else if (st.sbc_cap0 & 0x10) != 0 {
+        48_000
+    } else {
+        44_100
+    };
+    let freq = timer::frequency();
+    let pkt_samples = (FRAMES_PER_PKT * 128) as u64; // 640 samples (~14.51 ms at 44.1 kHz)
+    let pkt_ticks = (freq * pkt_samples) / sample_rate;
+    let lead_ticks = (freq * 110) / 1000; // Keep ~110 ms pre-buffer cushion in speaker jitter buffer
+
+    let now = timer::counter();
+    if A2DP_NEXT_TICK == 0 || now > A2DP_NEXT_TICK + (freq / 3) {
+        A2DP_NEXT_TICK = now.saturating_sub(pkt_ticks);
+    }
+
+    let mut sent_this_turn = 0u8;
+    while A2DP_NEXT_TICK <= now + lead_ticks && sent_this_turn < 2 {
+        let seq = A2DP_SEQ;
+        let ts = A2DP_TS;
+        A2DP_SEQ = A2DP_SEQ.wrapping_add(1);
+        A2DP_TS = A2DP_TS.wrapping_add(pkt_samples as u32);
+        A2DP_NEXT_TICK += pkt_ticks;
+        sent_this_turn += 1;
+
+        let mut media_pkt = [0u8; 440];
+        // 12-byte RTP Header (V=2, PT=96 dynamic A2DP payload, SSRC=0x00000001)
+        media_pkt[0] = 0x80;
+        media_pkt[1] = 0x60;
+        media_pkt[2] = (seq >> 8) as u8;
+        media_pkt[3] = (seq & 0xFF) as u8;
+        media_pkt[4] = (ts >> 24) as u8;
+        media_pkt[5] = (ts >> 16) as u8;
+        media_pkt[6] = (ts >> 8) as u8;
+        media_pkt[7] = (ts & 0xFF) as u8;
+        media_pkt[8] = 0x00;
+        media_pkt[9] = 0x00;
+        media_pkt[10] = 0x00;
+        media_pkt[11] = 0x01;
+        // 1-byte A2DP SBC Media Payload Header (`num_frames = 5`)
+        media_pkt[12] = FRAMES_PER_PKT as u8;
+
+        let mut off = 13usize;
+        let mut cur = A2DP_SAMPLE_CURSOR;
+        for _ in 0..FRAMES_PER_PKT {
+            let flen = encode_sbc_frame(
+                st.sbc_cap0,
+                st.sbc_cap1,
+                st.sbc_bitpool.clamp(2, 53),
+                st.a2dp_track,
+                &mut cur,
+                &mut media_pkt[off..],
+            );
+            off += flen;
+        }
+        A2DP_SAMPLE_CURSOR = cur;
+
+        let _ = hci_send_l2cap(st.acl_handle, st.avdtp_media_dcid, &media_pkt[..off]);
+        let _ = poll_a2dp_rx_fast(st.acl_handle);
+        STATE.with(|s| s.a2dp_packets_sent = s.a2dp_packets_sent.wrapping_add(1));
     }
 }
 
@@ -3407,9 +3577,11 @@ pub fn init() -> bool {
         return true;
     }
 
+    BT_CMD_ACTIVE.store(true, Ordering::SeqCst);
     uart::set_bt_mode(true);
 
     let ok = unsafe { init_bt_hw() };
+    BT_CMD_ACTIVE.store(false, Ordering::SeqCst);
     let st = status();
     if ok {
         crate::println!(

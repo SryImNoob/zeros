@@ -79,6 +79,9 @@ pub fn handle_irq() {
     // Poll buttons for debouncing (runs every tick for responsiveness)
     input::poll_buttons();
 
+    // Pump Bluetooth A2DP SBC audio frames at hardware 100Hz (10ms) cadence so LCD/UI work never starves audio
+    crate::drivers::bluetooth::pump_a2dp_audio();
+
     // Poll IR decoder and push any decoded frame to the input queue
     unsafe {
         let decoder = &mut *core::ptr::addr_of_mut!(input::ir::IR_DECODER);

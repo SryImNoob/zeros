@@ -47,12 +47,45 @@ const DEFAULT_QILIXIANG_LRC: &str = "\
 [01:14.00]我接着写 把永远爱你写进诗的结尾\n\
 [01:19.00]你是我唯一想要的了解";
 
+const DEFAULT_YEQU_LRC: &str = "\
+[00:00.00]夜曲 - 周杰伦 (词：方文山)\n\
+[00:04.00]一群嗜血的蚂蚁 被腐肉所吸引\n\
+[00:09.00]我面无表情 看孤独的风景\n\
+[00:14.00]失去你 爱恨开始分明\n\
+[00:19.00]失去你 还有什么事好关心\n\
+[00:24.00]当鸽子不再象征和平\n\
+[00:29.00]我终于被提醒 广场上喂食的是秃鹰\n\
+[00:34.00]我用漂亮的押韵 形容被掠夺一空的爱情\n\
+[00:39.00]为你弹奏萧邦的夜曲 纪念我死去的爱情\n\
+[00:45.00]跟夜风一样的声音 心碎得很好听\n\
+[00:50.00]手在键盘敲很轻 我给的思念很小心\n\
+[00:55.00]你埋葬的地方叫幽冥\n\
+[01:00.00]为你弹奏萧邦的夜曲 纪念我死去的爱情\n\
+[01:06.00]而我为你隐姓埋名 在月光下弹琴";
+
+const DEFAULT_QINGHUACI_LRC: &str = "\
+[00:00.00]青花瓷 - 周杰伦 (词：方文山)\n\
+[00:04.00]素胚勾勒出青花笔锋浓转淡\n\
+[00:09.00]瓶身描绘的牡丹一如你初妆\n\
+[00:14.00]冉冉檀香透过窗心事我了然\n\
+[00:19.00]宣纸上走笔至此搁一半\n\
+[00:24.00]釉色渲染仕女图韵味被私藏\n\
+[00:29.00]而你嫣然的一笑如含苞待放\n\
+[00:34.00]你的美一缕飘散 去到我去不了的地方\n\
+[00:40.00]天青色等烟雨 而我在等你\n\
+[00:45.00]炊烟袅袅升起 隔江千万里\n\
+[00:50.00]在瓶底书汉隶仿前朝的飘逸\n\
+[00:55.00]就当我为遇见你伏笔\n\
+[01:00.00]天青色等烟雨 而我在等你\n\
+[01:05.00]月色被打捞起 晕开了结局";
+
 pub struct MusicApp {
     tracks: Vec<SongTrack>,
     current_track: usize,
     playing: bool,
     play_pos_sec: u32,
     lyrics: Vec<LyricLine>,
+    last_rendered_lrc: usize,
     anim_tick: u32,
 }
 
@@ -60,42 +93,68 @@ impl MusicApp {
     pub fn new() -> Self {
         let mut tracks = Vec::new();
         tracks.push(SongTrack {
-            title: String::from("七里香 - 周杰伦"),
+            title: String::from("1/3 七里香 - 周杰伦"),
             duration_sec: 85,
             format_info: "MP3 320k",
         });
         tracks.push(SongTrack {
-            title: String::from("夜曲 - 周杰伦"),
-            duration_sec: 226,
+            title: String::from("2/3 夜曲 - 周杰伦"),
+            duration_sec: 76,
             format_info: "MP3 320k",
         });
+        tracks.push(SongTrack {
+            title: String::from("3/3 青花瓷 - 周杰伦"),
+            duration_sec: 80,
+            format_info: "FLAC 960k",
+        });
 
-        let lrc_raw = if fat32::is_mounted() {
-            fat32::read_file("/QILIXIANG.LRC")
-                .and_then(|b| core::str::from_utf8(&b).ok().map(String::from))
-                .unwrap_or_else(|| String::from(DEFAULT_QILIXIANG_LRC))
-        } else {
-            String::from(DEFAULT_QILIXIANG_LRC)
-        };
-        let lyrics = Self::parse_lrc(&lrc_raw);
+        let lyrics = Self::load_lyrics_for_track(0);
 
         Self {
             tracks,
             current_track: 0,
             playing: true,
-            play_pos_sec: 8,
+            play_pos_sec: 0,
             lyrics,
+            last_rendered_lrc: usize::MAX,
             anim_tick: 0,
         }
     }
 
-    pub fn play_track(&mut self, title: String) {
-        if let Some(first) = self.tracks.first_mut() {
-            first.title = title;
+    fn load_lyrics_for_track(track_idx: usize) -> Vec<LyricLine> {
+        match track_idx {
+            0 => {
+                let lrc_raw = if fat32::is_mounted() {
+                    fat32::read_file("/QILIXIANG.LRC")
+                        .and_then(|b| core::str::from_utf8(&b).ok().map(String::from))
+                        .unwrap_or_else(|| String::from(DEFAULT_QILIXIANG_LRC))
+                } else {
+                    String::from(DEFAULT_QILIXIANG_LRC)
+                };
+                Self::parse_lrc(&lrc_raw)
+            }
+            1 => Self::parse_lrc(DEFAULT_YEQU_LRC),
+            _ => Self::parse_lrc(DEFAULT_QINGHUACI_LRC),
         }
-        self.current_track = 0;
+    }
+
+    fn reload_lyrics(&mut self) {
+        self.lyrics = Self::load_lyrics_for_track(self.current_track);
+        self.last_rendered_lrc = usize::MAX;
+    }
+
+    pub fn play_track(&mut self, title: String) {
+        let lower = title.to_ascii_lowercase();
+        if lower.contains("yequ") || title.contains("夜曲") {
+            self.current_track = 1;
+        } else if lower.contains("qinghuaci") || title.contains("青花瓷") {
+            self.current_track = 2;
+        } else {
+            self.current_track = 0;
+        }
         self.play_pos_sec = 0;
         self.playing = true;
+        self.reload_lyrics();
         bluetooth::set_a2dp_playback(self.playing, self.current_track, self.play_pos_sec);
     }
 
@@ -105,6 +164,114 @@ impl MusicApp {
 
     pub fn is_playing(&self) -> bool {
         self.playing
+    }
+
+    fn active_lrc_index(&self) -> usize {
+        let mut active_lrc = 0usize;
+        for (i, lrc) in self.lyrics.iter().enumerate() {
+            if self.play_pos_sec >= lrc.time_sec {
+                active_lrc = i;
+            } else {
+                break;
+            }
+        }
+        active_lrc
+    }
+
+    fn draw_vinyl_and_spectrum(&self, canvas: &mut Canvas) {
+        canvas.fill_circle(40, 60, 17, colors::rgb(135, 75, 225));
+        let phase = (self.anim_tick & 7) as i32;
+        let offsets: [(i32, i32); 8] = [
+            (0, -11),
+            (8, -8),
+            (11, 0),
+            (8, 8),
+            (0, 11),
+            (-8, 8),
+            (-11, 0),
+            (-8, -8),
+        ];
+        let (ox, oy) = offsets[phase as usize];
+        canvas.fill_circle(40 + ox, 60 + oy, 2, colors::rgb(220, 185, 255));
+        canvas.fill_circle(40, 60, 5, colors::rgb(20, 28, 46));
+
+        // Clear spectrum region before drawing updated bars
+        canvas.fill_rect(146, 60, 156, 25, colors::rgb(19, 28, 46));
+        let base_bars: [i32; 14] = [6, 12, 18, 15, 20, 13, 10, 17, 19, 14, 11, 16, 10, 7];
+        for (idx, &base_h) in base_bars.iter().enumerate() {
+            let bh = if self.playing {
+                let wave =
+                    (((self.anim_tick as usize + idx * 3 + self.current_track * 5) * 7) % 11)
+                        as i32
+                        - 5;
+                (base_h + wave).clamp(4, 23)
+            } else {
+                4
+            };
+            let bx = 148 + (idx as i32) * 11;
+            canvas.fill_rrect(bx, 84 - bh, 8, bh, 2, colors::rgb(0, 215, 255));
+            canvas.fill_rrect(bx, 84 - bh, 8, 2, 1, colors::rgb(200, 250, 255));
+        }
+    }
+
+    fn draw_lyrics_box(&mut self, canvas: &mut Canvas) {
+        canvas.fill_rrect(14, 92, 292, 74, 5, colors::rgb(13, 19, 33));
+        canvas.stroke_rrect(14, 92, 292, 74, 5, colors::rgb(38, 58, 92));
+
+        let active_lrc = self.active_lrc_index();
+        self.last_rendered_lrc = active_lrc;
+
+        if active_lrc > 0 {
+            let prev_txt = &self.lyrics[active_lrc - 1].text;
+            let pw = Canvas::measure_mixed_text(prev_txt, 14);
+            let px = (160 - pw / 2).max(20);
+            canvas.draw_mixed_text(px, 98, prev_txt, colors::rgb(110, 132, 168), 14);
+        }
+
+        canvas.fill_rrect(20, 118, 280, 22, 4, colors::rgb(18, 44, 78));
+        if let Some(cur) = self.lyrics.get(active_lrc) {
+            let mut cur_line = String::from("♪ ");
+            cur_line.push_str(&cur.text);
+            let cw = Canvas::measure_mixed_text(&cur_line, 15);
+            let cx = (160 - cw / 2).max(24);
+            canvas.draw_mixed_text(cx, 121, &cur_line, colors::rgb(0, 235, 255), 15);
+        }
+
+        if let Some(next_lrc) = self.lyrics.get(active_lrc + 1) {
+            let nw = Canvas::measure_mixed_text(&next_lrc.text, 14);
+            let nx = (160 - nw / 2).max(20);
+            canvas.draw_mixed_text(nx, 146, &next_lrc.text, colors::rgb(125, 148, 185), 14);
+        }
+    }
+
+    fn draw_progress_bar(&self, canvas: &mut Canvas) {
+        canvas.fill_rect(12, 173, 296, 15, colors::rgb(19, 28, 46));
+        let track = &self.tracks[self.current_track];
+        let dur = track.duration_sec.max(1);
+        let pos = self.play_pos_sec.min(dur);
+        let mut t_left = String::with_capacity(6);
+        let _ = write!(t_left, "{:02}:{:02}", pos / 60, pos % 60);
+        let mut t_right = String::with_capacity(6);
+        let _ = write!(t_right, "{:02}:{:02}", dur / 60, dur % 60);
+
+        canvas.draw_str_ascii(14, 176, &t_left, colors::rgb(155, 180, 215));
+        canvas.fill_rrect(58, 178, 198, 5, 2, colors::rgb(32, 46, 72));
+        let fill_w = ((pos * 198) / dur) as i32;
+        if fill_w > 0 {
+            canvas.fill_rrect(58, 178, fill_w, 5, 2, colors::rgb(0, 215, 255));
+        }
+        canvas.fill_circle(58 + fill_w, 180, 4, colors::WHITE);
+        canvas.draw_str_ascii(264, 176, &t_right, colors::rgb(155, 180, 215));
+    }
+
+    /// Lightweight partial redraw called on 200ms animation ticks so SPI0 only flushes changed rows.
+    pub fn render_dynamic(&mut self, canvas: &mut Canvas) {
+        self.draw_vinyl_and_spectrum(canvas);
+        let active_lrc = self.active_lrc_index();
+        if active_lrc != self.last_rendered_lrc {
+            self.draw_lyrics_box(canvas);
+        }
+        self.draw_progress_bar(canvas);
     }
 
     fn parse_lrc(raw: &str) -> Vec<LyricLine> {
@@ -163,25 +330,11 @@ impl App for MusicApp {
         // Left: Vinyl Album Art Box (52x52) with rotating highlight dot
         canvas.fill_rrect(14, 34, 52, 52, 8, colors::rgb(42, 26, 82));
         canvas.stroke_rrect(14, 34, 52, 52, 8, colors::rgb(175, 115, 255));
-        canvas.fill_circle(40, 60, 17, colors::rgb(135, 75, 225));
-        let phase = (self.anim_tick & 7) as i32;
-        let offsets: [(i32, i32); 8] = [
-            (0, -11),
-            (8, -8),
-            (11, 0),
-            (8, 8),
-            (0, 11),
-            (-8, 8),
-            (-11, 0),
-            (-8, -8),
-        ];
-        let (ox, oy) = offsets[phase as usize];
-        canvas.fill_circle(40 + ox, 60 + oy, 2, colors::rgb(220, 185, 255));
-        canvas.fill_circle(40, 60, 5, colors::rgb(20, 28, 46));
 
         // Song Title + Bluetooth Speaker Pill
-        let track = &self.tracks[self.current_track];
-        canvas.draw_mixed_text(74, 34, &track.title, colors::WHITE, 15);
+        let track_title = self.tracks[self.current_track].title.clone();
+        let track_fmt = self.tracks[self.current_track].format_info;
+        canvas.draw_mixed_text(74, 34, &track_title, colors::WHITE, 14);
         let bt = bluetooth::status();
         canvas.fill_rrect(222, 34, 84, 15, 4, colors::rgb(20, 48, 44));
         if bt.connected_index.is_some() {
@@ -196,72 +349,15 @@ impl App for MusicApp {
         if bt.a2dp_ready && bt.connected_index.is_some() {
             canvas.draw_str_ascii(74, 54, "SBC 44.1k", colors::rgb(80, 245, 165));
         } else {
-            canvas.draw_str_ascii(74, 54, track.format_info, colors::rgb(150, 180, 220));
+            canvas.draw_str_ascii(74, 54, track_fmt, colors::rgb(150, 180, 220));
         }
-        let base_bars: [i32; 14] = [6, 12, 18, 15, 20, 13, 10, 17, 19, 14, 11, 16, 10, 7];
-        for (idx, &base_h) in base_bars.iter().enumerate() {
-            let bh = if self.playing {
-                let wave = (((self.anim_tick as usize + idx * 3) * 7) % 11) as i32 - 5;
-                (base_h + wave).clamp(4, 23)
-            } else {
-                4
-            };
-            let bx = 148 + (idx as i32) * 11;
-            canvas.fill_rrect(bx, 84 - bh, 8, bh, 2, colors::rgb(0, 215, 255));
-            canvas.fill_rrect(bx, 84 - bh, 8, 2, 1, colors::rgb(200, 250, 255));
-        }
+        self.draw_vinyl_and_spectrum(canvas);
 
         // Center: 3-Line Scrolling LRC Chinese Lyrics Box (y = 92..166)
-        canvas.fill_rrect(14, 92, 292, 74, 5, colors::rgb(13, 19, 33));
-        canvas.stroke_rrect(14, 92, 292, 74, 5, colors::rgb(38, 58, 92));
-
-        let mut active_lrc = 0usize;
-        for (i, lrc) in self.lyrics.iter().enumerate() {
-            if self.play_pos_sec >= lrc.time_sec {
-                active_lrc = i;
-            } else {
-                break;
-            }
-        }
-
-        if active_lrc > 0 {
-            let prev_txt = &self.lyrics[active_lrc - 1].text;
-            let pw = Canvas::measure_mixed_text(prev_txt, 14);
-            let px = (160 - pw / 2).max(20);
-            canvas.draw_mixed_text(px, 98, prev_txt, colors::rgb(110, 132, 168), 14);
-        }
-
-        canvas.fill_rrect(20, 118, 280, 22, 4, colors::rgb(18, 44, 78));
-        if let Some(cur) = self.lyrics.get(active_lrc) {
-            let mut cur_line = String::from("♪ ");
-            cur_line.push_str(&cur.text);
-            let cw = Canvas::measure_mixed_text(&cur_line, 15);
-            let cx = (160 - cw / 2).max(24);
-            canvas.draw_mixed_text(cx, 121, &cur_line, colors::rgb(0, 235, 255), 15);
-        }
-
-        if let Some(next_lrc) = self.lyrics.get(active_lrc + 1) {
-            let nw = Canvas::measure_mixed_text(&next_lrc.text, 14);
-            let nx = (160 - nw / 2).max(20);
-            canvas.draw_mixed_text(nx, 146, &next_lrc.text, colors::rgb(125, 148, 185), 14);
-        }
+        self.draw_lyrics_box(canvas);
 
         // Progress Bar (y = 176)
-        let dur = track.duration_sec.max(1);
-        let pos = self.play_pos_sec.min(dur);
-        let mut t_left = String::with_capacity(6);
-        let _ = write!(t_left, "{:02}:{:02}", pos / 60, pos % 60);
-        let mut t_right = String::with_capacity(6);
-        let _ = write!(t_right, "{:02}:{:02}", dur / 60, dur % 60);
-
-        canvas.draw_str_ascii(14, 176, &t_left, colors::rgb(155, 180, 215));
-        canvas.fill_rrect(58, 178, 198, 5, 2, colors::rgb(32, 46, 72));
-        let fill_w = ((pos * 198) / dur) as i32;
-        if fill_w > 0 {
-            canvas.fill_rrect(58, 178, fill_w, 5, 2, colors::rgb(0, 215, 255));
-        }
-        canvas.fill_circle(58 + fill_w, 180, 4, colors::WHITE);
-        canvas.draw_str_ascii(264, 176, &t_right, colors::rgb(155, 180, 215));
+        self.draw_progress_bar(canvas);
 
         // Bottom Control Buttons Row (y = 204..234) — 1:1 mapped to B1..B4 short-press
         let play_label = if self.playing {
@@ -301,20 +397,38 @@ impl App for MusicApp {
                 self.current_track =
                     (self.current_track + self.tracks.len() - 1) % self.tracks.len();
                 self.play_pos_sec = 0;
+                self.playing = true;
+                self.reload_lyrics();
                 bluetooth::set_a2dp_playback(self.playing, self.current_track, self.play_pos_sec);
+                crate::println!(
+                    "[MUSIC] B1 Prev -> Track {}: {}",
+                    self.current_track + 1,
+                    self.tracks[self.current_track].title
+                );
                 AppIntent::None
             }
             1 => {
                 // 2.播放 / 暂停
                 self.playing = !self.playing;
                 bluetooth::set_a2dp_playback(self.playing, self.current_track, self.play_pos_sec);
+                crate::println!(
+                    "[MUSIC] B2 Play/Pause -> playing={}",
+                    self.playing
+                );
                 AppIntent::None
             }
             2 => {
                 // 3.下一曲
                 self.current_track = (self.current_track + 1) % self.tracks.len();
                 self.play_pos_sec = 0;
+                self.playing = true;
+                self.reload_lyrics();
                 bluetooth::set_a2dp_playback(self.playing, self.current_track, self.play_pos_sec);
+                crate::println!(
+                    "[MUSIC] B3 Next -> Track {}: {}",
+                    self.current_track + 1,
+                    self.tracks[self.current_track].title
+                );
                 AppIntent::None
             }
             _ => {

@@ -33,6 +33,7 @@ pub struct DesktopShell {
     active_app: AppId,
     needs_full_redraw: bool,
     needs_dynamic_redraw: bool,
+    last_clock_sec: u64,
 
     // Hosted applications
     music_app: MusicApp,
@@ -48,6 +49,7 @@ impl DesktopShell {
             active_app: AppId::Music,
             needs_full_redraw: true,
             needs_dynamic_redraw: false,
+            last_clock_sec: u64::MAX,
             music_app: MusicApp::new(),
             reader_app: ReaderApp::new(),
             media_bt_app: MediaBtApp::new(),
@@ -95,11 +97,16 @@ impl DesktopShell {
                 self.needs_full_redraw = true;
                 self.render();
                 let ok = bluetooth::connect_device(idx);
+                self.media_bt_app.on_connect_finished(idx, ok);
                 if ok {
                     self.music_app.sync_a2dp_state();
                     bluetooth::pump_a2dp_audio();
+                    if bluetooth::status().a2dp_ready {
+                        // Automatically switch to 1.听歌 (MusicApp) when A2DP speaker connects
+                        // so B1 (1.上一曲), B2 (2.暂停), and B3 (3.下一曲) work immediately!
+                        self.active_app = AppId::Music;
+                    }
                 }
-                self.media_bt_app.on_connect_finished(idx, ok);
                 self.needs_full_redraw = true;
             }
         }
@@ -239,6 +246,7 @@ impl DesktopShell {
             .draw_str_ascii(235, 6, "A2DP", colors::rgb(90, 245, 165));
 
         let up_sec = timer::ticks() / 100;
+        self.last_clock_sec = up_sec;
         let mm = (up_sec / 60) % 100;
         let ss = up_sec % 60;
         let mut clk = String::with_capacity(6);
@@ -247,19 +255,32 @@ impl DesktopShell {
             .draw_str_ascii(275, 6, &clk, colors::rgb(220, 235, 255));
     }
 
+    fn update_top_clock(&mut self) {
+        let up_sec = timer::ticks() / 100;
+        if up_sec != self.last_clock_sec {
+            self.last_clock_sec = up_sec;
+            self.canvas
+                .fill_rect(273, 4, 44, 13, colors::rgb(16, 24, 42));
+            let mm = (up_sec / 60) % 100;
+            let ss = up_sec % 60;
+            let mut clk = String::with_capacity(6);
+            let _ = write!(clk, "{:02}:{:02}", mm, ss);
+            self.canvas
+                .draw_str_ascii(275, 6, &clk, colors::rgb(220, 235, 255));
+        }
+    }
+
     /// Render the active application into the off-screen canvas and flush dirty regions over SPI.
     pub fn render(&mut self) {
-        if self.needs_full_redraw || self.needs_dynamic_redraw {
-            if self.needs_full_redraw {
-                self.canvas.fill_gradient_v(
-                    0,
-                    22,
-                    SCREEN_W,
-                    SCREEN_H - 22,
-                    (12, 18, 32),
-                    (8, 12, 22),
-                );
-            }
+        if self.needs_full_redraw {
+            self.canvas.fill_gradient_v(
+                0,
+                22,
+                SCREEN_W,
+                SCREEN_H - 22,
+                (12, 18, 32),
+                (8, 12, 22),
+            );
             self.draw_top_bar();
             match self.active_app {
                 AppId::Music => self.music_app.render(&mut self.canvas),
@@ -269,6 +290,16 @@ impl DesktopShell {
             }
             self.canvas.flush();
             self.needs_full_redraw = false;
+            self.needs_dynamic_redraw = false;
+        } else if self.needs_dynamic_redraw {
+            self.update_top_clock();
+            match self.active_app {
+                AppId::Music => self.music_app.render_dynamic(&mut self.canvas),
+                AppId::Reader => self.reader_app.render(&mut self.canvas),
+                AppId::MediaBt => self.media_bt_app.render(&mut self.canvas),
+                AppId::System => self.system_app.render(&mut self.canvas),
+            }
+            self.canvas.flush();
             self.needs_dynamic_redraw = false;
         }
     }

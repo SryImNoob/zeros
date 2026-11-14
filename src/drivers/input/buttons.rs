@@ -36,7 +36,7 @@ static BUTTON_DEBOUNCED: AtomicU32 = AtomicU32::new(0);
 static DEBOUNCE_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Debounce threshold (number of consistent samples before accepting state change)
-const DEBOUNCE_THRESHOLD: u32 = 3;
+const DEBOUNCE_THRESHOLD: u32 = 2;
 
 // ─── Event Queue ───
 /// Input event types
