@@ -902,7 +902,7 @@ pub fn scan_devices() -> usize {
         init();
     }
 
-    BT_CMD_ACTIVE.store(true, Ordering::SeqCst);
+    BT_CMD_ACTIVE.store(true, Ordering::Relaxed);
 
     let mut list = [BtDeviceInfo::empty(); MAX_DISCOVERED_DEVICES];
     let mut count = 0usize;
@@ -1362,7 +1362,7 @@ pub fn scan_devices() -> usize {
         s.a2dp_ready = false;
         s.avdtp_streaming = false;
     });
-    BT_CMD_ACTIVE.store(false, Ordering::SeqCst);
+    BT_CMD_ACTIVE.store(false, Ordering::Relaxed);
 
     count
 }
@@ -2020,7 +2020,7 @@ pub fn connect_device(idx: usize) -> bool {
 
     let mut dev = st.devices[idx];
 
-    BT_CMD_ACTIVE.store(true, Ordering::SeqCst);
+    BT_CMD_ACTIVE.store(true, Ordering::Relaxed);
 
     let mut connected_handle: Option<u16> = None;
     let mut a2dp_ready = false;
@@ -2809,13 +2809,13 @@ pub fn connect_device(idx: usize) -> bool {
             RUNTIME_CS.a2dp_ready = a2dp_ready;
             RUNTIME_REASM = AclReassembler::new();
         }
-        BT_CMD_ACTIVE.store(false, Ordering::SeqCst);
+        BT_CMD_ACTIVE.store(false, Ordering::Relaxed);
         true
     } else {
         STATE.with(|s| {
             s.last_conn_err = last_err;
         });
-        BT_CMD_ACTIVE.store(false, Ordering::SeqCst);
+        BT_CMD_ACTIVE.store(false, Ordering::Relaxed);
         false
     }
 }
@@ -3168,7 +3168,12 @@ unsafe fn encode_sbc_frame(
     let alloc_snr = (sbc_cap1 & 0x02) != 0;
 
     // Synthesize 16 subband blocks (`16 * 8 = 128` PCM samples per SBC frame) using continuous Q24 phase accumulators
-    let mut sb_samples = [[[0i32; 8]; 2]; 16];
+    static mut A2DP_SB_SAMPLES: [[[i32; 8]; 2]; 16] = [[[0i32; 8]; 2]; 16];
+    let sb_samples = &mut *(&raw mut A2DP_SB_SAMPLES);
+    for blk in 0..16 {
+        sb_samples[blk][0] = [0; 8];
+        sb_samples[blk][1] = [0; 8];
+    }
     let step_samples: u32 = match track_idx {
         0 => 14_336, // ~0.325s/note (ballad tempo for 七里香)
         1 => 10_240, // ~0.232s/note (fast rhythmic tempo for 夜曲)
@@ -3349,7 +3354,8 @@ unsafe fn uart0_getc_us(timeout_us: u64) -> Option<u8> {
 /// Fast non-blocking `UART0` RX drainer for active A2DP streaming (`< 0.15 ms` max latency).
 /// Consumes `0x13 (Number_Of_Completed_Packets)` events and dispatches incoming AVRCP/AVDTP L2CAP packets.
 unsafe fn poll_a2dp_rx_fast(acl_handle: u16) -> bool {
-    let mut rx_pkt = [0u8; 260];
+    static mut A2DP_RX_PKT: [u8; 260] = [0u8; 260];
+    let rx_pkt = &mut *(&raw mut A2DP_RX_PKT);
     let mut guard = 8u8;
 
     while guard > 0 && (mmio::read(UART_FR) & FR_RXFE) == 0 {
@@ -3446,15 +3452,22 @@ unsafe fn poll_a2dp_rx_fast(acl_handle: u16) -> bool {
 /// to the connected Bluetooth speaker (`SRS-XB100`).
 ///
 /// Safe to call from both `timer::handle_irq()` (`100Hz` hardware timer IRQ) and `ui_task()`.
+/// Uses IRQ-masked `Ordering::Relaxed` instead of `ldaxrb`/`stlxrb` (`compare_exchange`) because
+/// Cortex-A53 Non-Cacheable Normal memory faults on exclusive monitor instructions (`src/sync/mod.rs`).
 pub fn pump_a2dp_audio() {
     if bsp::is_qemu() || BT_CMD_ACTIVE.load(Ordering::Relaxed) {
         return;
     }
 
-    if A2DP_PUMP_ACTIVE
-        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-        .is_err()
-    {
+    let acquired = crate::kernel::interrupts::without_interrupts(|| {
+        if BT_CMD_ACTIVE.load(Ordering::Relaxed) || A2DP_PUMP_ACTIVE.load(Ordering::Relaxed) {
+            false
+        } else {
+            A2DP_PUMP_ACTIVE.store(true, Ordering::Relaxed);
+            true
+        }
+    });
+    if !acquired {
         return;
     }
 
@@ -3462,12 +3475,41 @@ pub fn pump_a2dp_audio() {
         pump_a2dp_audio_inner();
     }
 
-    A2DP_PUMP_ACTIVE.store(false, Ordering::Release);
+    A2DP_PUMP_ACTIVE.store(false, Ordering::Relaxed);
+}
+
+#[derive(Clone, Copy)]
+struct A2dpPumpSnap {
+    active_acl: bool,
+    acl_handle: u16,
+    a2dp_ready: bool,
+    a2dp_playing: bool,
+    avdtp_streaming: bool,
+    avdtp_sig_dcid: u16,
+    avdtp_media_dcid: u16,
+    acp_seid_shifted: u8,
+    sbc_cap0: u8,
+    sbc_cap1: u8,
+    sbc_bitpool: u8,
+    a2dp_track: u8,
 }
 
 unsafe fn pump_a2dp_audio_inner() {
-    let st = status();
-    if !st.initialized || !st.hci_up || st.connected_index.is_none() || st.acl_handle == 0 {
+    let st = STATE.with(|s| A2dpPumpSnap {
+        active_acl: s.initialized && s.hci_up && s.connected_index.is_some() && s.acl_handle != 0,
+        acl_handle: s.acl_handle,
+        a2dp_ready: s.a2dp_ready,
+        a2dp_playing: s.a2dp_playing,
+        avdtp_streaming: s.avdtp_streaming,
+        avdtp_sig_dcid: s.avdtp_sig_dcid,
+        avdtp_media_dcid: s.avdtp_media_dcid,
+        acp_seid_shifted: s.acp_seid_shifted,
+        sbc_cap0: s.sbc_cap0,
+        sbc_cap1: s.sbc_cap1,
+        sbc_bitpool: s.sbc_bitpool,
+        a2dp_track: s.a2dp_track,
+    });
+    if !st.active_acl {
         return;
     }
 
@@ -3484,7 +3526,8 @@ unsafe fn pump_a2dp_audio_inner() {
     if !st.avdtp_streaming && st.avdtp_sig_dcid != 0 {
         let start_cmd: [u8; 3] = [0x50, 0x07, st.acp_seid_shifted];
         let _ = hci_send_l2cap(st.acl_handle, st.avdtp_sig_dcid, &start_cmd);
-        RUNTIME_CS.avdtp_streaming = true;
+        let cs_ptr = &raw mut RUNTIME_CS;
+        (*cs_ptr).avdtp_streaming = true;
         STATE.with(|s| s.avdtp_streaming = true);
     }
 
@@ -3509,6 +3552,9 @@ unsafe fn pump_a2dp_audio_inner() {
         A2DP_NEXT_TICK = now.saturating_sub(pkt_ticks);
     }
 
+    static mut A2DP_MEDIA_PKT: [u8; 440] = [0u8; 440];
+    let media_pkt = &mut *(&raw mut A2DP_MEDIA_PKT);
+
     let mut sent_this_turn = 0u8;
     while A2DP_NEXT_TICK <= now + lead_ticks && sent_this_turn < 2 {
         let seq = A2DP_SEQ;
@@ -3518,7 +3564,6 @@ unsafe fn pump_a2dp_audio_inner() {
         A2DP_NEXT_TICK += pkt_ticks;
         sent_this_turn += 1;
 
-        let mut media_pkt = [0u8; 440];
         // 12-byte RTP Header (V=2, PT=96 dynamic A2DP payload, SSRC=0x00000001)
         media_pkt[0] = 0x80;
         media_pkt[1] = 0x60;
@@ -3577,11 +3622,11 @@ pub fn init() -> bool {
         return true;
     }
 
-    BT_CMD_ACTIVE.store(true, Ordering::SeqCst);
+    BT_CMD_ACTIVE.store(true, Ordering::Relaxed);
     uart::set_bt_mode(true);
 
     let ok = unsafe { init_bt_hw() };
-    BT_CMD_ACTIVE.store(false, Ordering::SeqCst);
+    BT_CMD_ACTIVE.store(false, Ordering::Relaxed);
     let st = status();
     if ok {
         crate::println!(
