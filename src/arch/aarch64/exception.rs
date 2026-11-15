@@ -158,10 +158,22 @@ exc_default_entry:
 #[no_mangle]
 pub extern "C" fn sync_exception_handler(ctx: &ExceptionContext) {
     let ec = (ctx.esr >> 26) & 0x3F;
+    let far: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, far_el1", out(reg) far);
+    }
     crate::println!("!!! SYNC EXCEPTION !!!");
-    crate::println!("  EC=0x{:02x} ESR=0x{:016x}", ec, ctx.esr);
-    crate::println!("  ELR=0x{:016x} SPSR=0x{:08x}", ctx.elr, ctx.spsr);
-    // Halt
+    crate::println!("  EC=0x{:02x} ESR=0x{:016x} FAR=0x{:016x}", ec, ctx.esr, far);
+    crate::println!(
+        "  ELR=0x{:016x} LR(x30)=0x{:016x} SPSR=0x{:08x}",
+        ctx.elr,
+        ctx.gpr[30],
+        ctx.spsr
+    );
+    crate::kernel::klog::flush_emergency("SYNC_EXCEPTION");
+    if !crate::bsp::is_qemu() {
+        crate::kernel::tryboot::reboot_to_partition(0);
+    }
     loop {
         unsafe { core::arch::asm!("wfe"); }
     }
@@ -171,9 +183,15 @@ pub extern "C" fn sync_exception_handler(ctx: &ExceptionContext) {
 #[no_mangle]
 pub extern "C" fn default_exception_handler(ctx: &ExceptionContext) {
     crate::println!(
-        "\n!!! UNEXPECTED EXCEPTION !!!\n  ESR=0x{:08x}  ELR=0x{:016x}",
-        ctx.esr, ctx.elr
+        "\n!!! UNEXPECTED EXCEPTION !!!\n  ESR=0x{:08x}  ELR=0x{:016x}  LR=0x{:016x}",
+        ctx.esr,
+        ctx.elr,
+        ctx.gpr[30]
     );
+    crate::kernel::klog::flush_emergency("UNEXPECTED_EXCEPTION");
+    if !crate::bsp::is_qemu() {
+        crate::kernel::tryboot::reboot_to_partition(0);
+    }
     loop {
         unsafe { core::arch::asm!("wfe"); }
     }

@@ -95,9 +95,11 @@ impl fmt::Write for Writer {
 pub fn _print(args: fmt::Arguments) {
     crate::kernel::interrupts::without_interrupts(|| {
         use fmt::Write;
-        // Always write to UART
+        // 1. Append to persistent in-memory blackbox ring buffer (`ZEROS.LOG`)
+        crate::kernel::klog::write_fmt_unlocked(args);
+        // 2. Write to UART (if not owned by Bluetooth HCI)
         Writer.write_fmt(args).unwrap();
-        // Also write to screen console / log history
+        // 3. Write to screen console / log history
         crate::kernel::console::write_fmt(args);
     });
 }

@@ -41,15 +41,18 @@ pub fn disable_timer_irq() {
 
 /// Top-level IRQ dispatcher — called from the exception vector table
 #[no_mangle]
-pub extern "C" fn irq_dispatch(_ctx: &ExceptionContext) {
+pub extern "C" fn irq_dispatch(ctx: &ExceptionContext) {
     let source = unsafe { mmio::read(CORE0_IRQ_SOURCE) };
 
     if source & IRQ_SRC_CNTPNSIRQ != 0 {
+        let t0 = timer::counter();
         timer::handle_irq();
+        let dt_ticks = timer::counter().saturating_sub(t0);
+        let freq = timer::frequency().max(1);
+        let irq_us = (dt_ticks * 1_000_000) / freq;
+        crate::kernel::klog::record_irq_and_check_lockup(irq_us, ctx.elr, ctx.gpr[30]);
         crate::kernel::task::preempt_from_irq();
     }
-
-    // Future: check other interrupt sources here
 }
 
 /// Enable IRQs globally (unmask DAIF.I)

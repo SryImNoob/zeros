@@ -2,5 +2,6 @@
 
 pub mod console;
 pub mod interrupts;
+pub mod klog;
 pub mod task;
 pub mod tryboot;

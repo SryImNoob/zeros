@@ -191,6 +191,25 @@ pub fn is_mounted() -> bool {
     unsafe { (*core::ptr::addr_of!(VOLUME)).is_some() }
 }
 
+/// Return sectors per cluster of the mounted FAT32 volume (`0` if not mounted).
+pub fn sectors_per_cluster() -> usize {
+    match unsafe { &*core::ptr::addr_of!(VOLUME) } {
+        Some(v) => v.sectors_per_cluster as usize,
+        None => 0,
+    }
+}
+
+/// Convert a cluster number (`>= 2`) to its starting physical LBA sector (`0` if not mounted).
+pub fn cluster_to_lba(cluster: u32) -> u32 {
+    if cluster < 2 {
+        return 0;
+    }
+    match unsafe { &*core::ptr::addr_of!(VOLUME) } {
+        Some(v) => v.cluster_to_lba(cluster),
+        None => 0,
+    }
+}
+
 /// Get discovered MBR partitions.
 pub fn partitions() -> [Option<PartitionInfo>; 4] {
     unsafe { *core::ptr::addr_of!(PARTITIONS) }

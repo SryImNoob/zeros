@@ -84,24 +84,41 @@ impl DesktopShell {
             }
             AppIntent::ScanBluetooth => {
                 // Immediately flush scanning banner to LCD before starting 5s HCI Inquiry
+                crate::println!("[UI] Starting Bluetooth scan...");
+                crate::kernel::klog::flush();
                 self.media_bt_app.set_scanning_banner();
                 self.needs_full_redraw = true;
                 self.render();
                 let found = bluetooth::scan_devices();
+                crate::println!("[UI] Bluetooth scan finished: found={} devices", found);
+                crate::kernel::klog::flush();
                 self.media_bt_app.on_scan_finished(found);
                 self.needs_full_redraw = true;
             }
             AppIntent::ConnectBluetooth(idx) => {
                 // Immediately flush connecting banner to LCD before starting ACL + SSP handshake
+                crate::println!("[UI] Connecting to Bluetooth device idx={}...", idx);
+                crate::kernel::klog::flush();
                 self.media_bt_app.set_connecting_banner(idx);
                 self.needs_full_redraw = true;
                 self.render();
                 let ok = bluetooth::connect_device(idx);
+                let bt_st = bluetooth::status();
+                crate::println!(
+                    "[UI] Connect idx={} result: ok={}, a2dp_ready={}, media_dcid=0x{:04X}, err=0x{:02X}",
+                    idx,
+                    ok,
+                    bt_st.a2dp_ready,
+                    bt_st.avdtp_media_dcid,
+                    bt_st.last_conn_err
+                );
+                crate::kernel::klog::flush();
                 self.media_bt_app.on_connect_finished(idx, ok);
                 if ok {
                     self.music_app.sync_a2dp_state();
+                    bluetooth::refill_sbc_pkt_ring();
                     bluetooth::pump_a2dp_audio();
-                    if bluetooth::status().a2dp_ready {
+                    if bt_st.a2dp_ready {
                         // Automatically switch to 1.听歌 (MusicApp) when A2DP speaker connects
                         // so B1 (1.上一曲), B2 (2.暂停), and B3 (3.下一曲) work immediately!
                         self.active_app = AppId::Music;
@@ -347,10 +364,12 @@ pub fn ui_task() {
     let mut sub_tick = 0u32;
 
     loop {
+        crate::kernel::klog::heartbeat();
         if !crate::bsp::is_qemu() {
             tryboot::watchdog_feed(15);
         }
         crate::audio::refill_pcm_ring();
+        bluetooth::refill_sbc_pkt_ring();
         bluetooth::pump_a2dp_audio();
         shell.poll_avrcp();
 
@@ -364,12 +383,16 @@ pub fn ui_task() {
 
         shell.render();
         crate::audio::refill_pcm_ring();
+        bluetooth::refill_sbc_pkt_ring();
         bluetooth::pump_a2dp_audio();
 
         task::sleep_ms(10);
         sub_tick = sub_tick.wrapping_add(1);
         if sub_tick % 20 == 0 {
             shell.tick_200ms(sub_tick / 20);
+        }
+        if sub_tick % 100 == 0 {
+            crate::kernel::klog::flush();
         }
     }
 }

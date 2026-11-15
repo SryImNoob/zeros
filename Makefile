@@ -8,7 +8,7 @@ SDCARD_IMG = sdcard.img
 # Load local git-ignored configuration (e.g. RPI_HOST)
 -include local.mk
 
-.PHONY: build sdimage clean qemu qemu-display objdump sdcard deploy tryboot
+.PHONY: build sdimage clean qemu qemu-display objdump sdcard deploy tryboot log
 
 # Build the kernel binary
 build:
@@ -67,8 +67,14 @@ deploy: build
 	scp $(KERNEL_IMG) $(RPI_HOST):/tmp/zeros.img
 	ssh -t $(RPI_HOST) 'BOOT_DIR=/boot/firmware; [ ! -d "$$BOOT_DIR" ] && BOOT_DIR=/boot; \
 		sudo cp /tmp/zeros.img $$BOOT_DIR/zeros.img && \
+		if [ ! -f "$$BOOT_DIR/ZEROS.LOG" ]; then sudo dd if=/dev/zero bs=512 count=128 2>/dev/null | tr "\0" " " | sudo tee $$BOOT_DIR/ZEROS.LOG > /dev/null; fi && \
 		printf "arm_64bit=1\nkernel=zeros.img\nkernel_address=0x80000\nenable_uart=1\ndtparam=spi=on\n" | sudo tee $$BOOT_DIR/tryboot.txt > /dev/null && \
-		echo "✅ Deployed zeros.img and tryboot.txt to $$BOOT_DIR on $(RPI_HOST)"'
+		sync && \
+		echo "✅ Deployed zeros.img, ZEROS.LOG (64KB), and tryboot.txt to $$BOOT_DIR on $(RPI_HOST)"'
+
+# Read persistent kernel blackbox log from Raspberry Pi SD card
+log:
+	ssh $(RPI_HOST) 'BOOT_DIR=/boot/firmware; [ ! -d "$$BOOT_DIR" ] && BOOT_DIR=/boot; sed "s/[[:space:]]*$$//" $$BOOT_DIR/ZEROS.LOG | grep -v "^$$"'
 
 # Deploy and immediately one-shot reboot into ZerOS via tryboot
 tryboot: deploy

@@ -104,6 +104,7 @@ pub extern "C" fn kernel_main() -> ! {
             tryboot::watchdog_feed(15);
         }
         if fat32::init() {
+            kernel::klog::init();
             let entries = fat32::list_root();
             println!("[OK] FAT32 root directory ({} files):", entries.len());
             for entry in entries.iter().take(5) {
@@ -125,6 +126,7 @@ pub extern "C" fn kernel_main() -> ! {
         tryboot::watchdog_feed(15);
     }
     tryboot::init();
+    kernel::klog::flush();
 
     // ── Stage 7: Task Scheduler & Interactive GUI (M7.1) ──
     task::init();
@@ -172,10 +174,15 @@ fn heartbeat_task() {
         let active = task::active_count();
         console::update_status_bar(seconds, active, slot_str);
 
+        let (last_irq_us, max_irq_us) = kernel::klog::irq_stats_us();
+        let bt = drivers::bluetooth::status();
         println!(
-            "[TICK] {}s uptime (slot: {}, tasks: {})",
-            seconds, slot_str, active
+            "[TICK] {}s up (tasks={}, irq={}/{}us, bt_conn={:?}, a2dp_pkts={})",
+            seconds, active, last_irq_us, max_irq_us, bt.connected_index, bt.a2dp_packets_sent
         );
+        if seconds % 2 == 0 {
+            kernel::klog::flush();
+        }
     }
 }
 
@@ -259,8 +266,10 @@ fn panic(info: &PanicInfo) -> ! {
             location.column()
         );
     }
-    if let Some(msg) = info.message().as_str() {
-        println!("  {}", msg);
+    println!("  {}", info.message());
+    kernel::klog::flush_emergency("KERNEL_PANIC");
+    if !bsp::is_qemu() {
+        tryboot::reboot_to_partition(0);
     }
     loop {
         unsafe {

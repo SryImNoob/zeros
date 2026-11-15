@@ -197,6 +197,7 @@ pub fn watchdog_start(seconds: u32) {
 /// Feed (reload) the hardware watchdog timer.
 #[allow(dead_code)]
 pub fn watchdog_feed(seconds: u32) {
+    crate::kernel::klog::heartbeat();
     let ticks = (seconds.min(15) << 16) & PM_WDOG_TIME_SET;
     unsafe {
         mmio::write(PM_WDOG, PM_PASSWORD | ticks);
@@ -216,6 +217,7 @@ pub fn watchdog_stop() {
 #[allow(dead_code)]
 pub fn reboot_to_partition(partition: u8) -> ! {
     crate::println!("[SYS] Rebooting into partition {}...", partition);
+    crate::kernel::klog::flush_emergency("REBOOT_TO_PARTITION");
     crate::interrupts::disable();
 
     // Encode partition number into PM_RSTS
