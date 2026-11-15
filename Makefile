@@ -68,9 +68,25 @@ deploy: build
 	ssh -t $(RPI_HOST) 'BOOT_DIR=/boot/firmware; [ ! -d "$$BOOT_DIR" ] && BOOT_DIR=/boot; \
 		sudo cp /tmp/zeros.img $$BOOT_DIR/zeros.img && \
 		if [ ! -f "$$BOOT_DIR/ZEROS.LOG" ]; then sudo dd if=/dev/zero bs=512 count=128 2>/dev/null | tr "\0" " " | sudo tee $$BOOT_DIR/ZEROS.LOG > /dev/null; fi && \
+		if [ ! -f "$$BOOT_DIR/FW43430.BIN" ]; then \
+			FW_SRC=$$(ls /lib/firmware/brcm/brcmfmac43430*-sdio.bin 2>/dev/null | head -1); \
+			[ -n "$$FW_SRC" ] && sudo cp -L "$$FW_SRC" $$BOOT_DIR/FW43430.BIN; \
+		fi && \
+		if [ ! -f "$$BOOT_DIR/FW43430.TXT" ]; then \
+			NV_SRC=$$(ls /lib/firmware/brcm/brcmfmac43430*-sdio*.txt 2>/dev/null | head -1); \
+			[ -n "$$NV_SRC" ] && sudo cp -L "$$NV_SRC" $$BOOT_DIR/FW43430.TXT; \
+		fi && \
+		if [ ! -f "$$BOOT_DIR/WIFI.TXT" ]; then \
+			SSID=$$(iwgetid -r 2>/dev/null || nmcli -t -f active,ssid dev wifi 2>/dev/null | grep "^yes:" | cut -d: -f2 | head -1); \
+			PASS=$$(sudo grep -rhE "^(psk|wifi-sec\.psk)=" /etc/NetworkManager/system-connections/ /etc/wpa_supplicant/ 2>/dev/null | head -1 | cut -d= -f2- | tr -d "\""); \
+			IP=$$(hostname -I 2>/dev/null | awk "{print \$$1}"); \
+			GW=$$(ip route 2>/dev/null | awk "/^default/ {print \$$3; exit}"); \
+			printf "SSID=%s\nPASS=%s\nIP=%s\nGW=%s\n" "$$SSID" "$$PASS" "$$IP" "$$GW" | sudo tee $$BOOT_DIR/WIFI.TXT > /dev/null; \
+		fi && \
+		python3 -c "import urllib.request, json; uks=[]; [uks.append(json.loads(urllib.request.urlopen(\"https://music.163.com/api/login/qrcode/unikey?type=1\", timeout=3).read()).get(\"unikey\",\"\")) for _ in range(6)]; print(\"\\n\".join([u for u in uks if len(u)==36]))" 2>/dev/null | sudo tee $$BOOT_DIR/UNIKEY.TXT > /dev/null || true && \
 		printf "arm_64bit=1\nkernel=zeros.img\nkernel_address=0x80000\nenable_uart=1\ndtparam=spi=on\n" | sudo tee $$BOOT_DIR/tryboot.txt > /dev/null && \
 		sync && \
-		echo "✅ Deployed zeros.img, ZEROS.LOG (64KB), and tryboot.txt to $$BOOT_DIR on $(RPI_HOST)"'
+		echo "✅ Deployed zeros.img, FW43430.BIN/TXT, WIFI.TXT, UNIKEY.TXT, and tryboot.txt to $$BOOT_DIR on $(RPI_HOST)"'
 
 # Read persistent kernel blackbox log from Raspberry Pi SD card
 log:

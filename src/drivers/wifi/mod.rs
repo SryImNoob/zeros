@@ -481,6 +481,334 @@ pub unsafe fn backplane_read32(addr: u32) -> u32 {
     }
 }
 
+/// Write a 32-bit word to the Silicon Backplane via Function 1 (`0x08000` 32-bit access bit).
+pub unsafe fn backplane_write32(addr: u32, val: u32) {
+    set_backplane_window(addr);
+    let off = (addr & 0x7FFF) | 0x08000;
+    let bytes = val.to_le_bytes();
+    if sdio_cmd53_write(1, off, true, &bytes).is_err() {
+        let _ = sdio_cmd52(true, 1, off, bytes[0]);
+        let _ = sdio_cmd52(true, 1, off + 1, bytes[1]);
+        let _ = sdio_cmd52(true, 1, off + 2, bytes[2]);
+        let _ = sdio_cmd52(true, 1, off + 3, bytes[3]);
+    }
+}
+
+/// Write an arbitrary byte slice into Silicon Backplane RAM (`0x0000_0000..0x0008_0000`)
+/// using 64-byte Function 1 `CMD53` bursts across 32 KB window boundaries.
+unsafe fn backplane_write_ram(mut addr: u32, mut data: &[u8]) -> bool {
+    let mut bytes_since_wdt = 0usize;
+    while !data.is_empty() {
+        set_backplane_window(addr);
+        let win_off = (addr & 0x7FFF) as usize;
+        let win_rem = 0x8000usize - win_off;
+        let chunk_len = data.len().min(64).min(win_rem);
+        let aligned_len = (chunk_len + 3) & !3;
+
+        let mut tmp = [0u8; 64];
+        tmp[..chunk_len].copy_from_slice(&data[..chunk_len]);
+        let off = (win_off as u32) | 0x08000;
+        if sdio_cmd53_write(1, off, true, &tmp[..aligned_len]).is_err() {
+            return false;
+        }
+
+        addr += chunk_len as u32;
+        data = &data[chunk_len..];
+        bytes_since_wdt += chunk_len;
+        if bytes_since_wdt >= 32_768 {
+            bytes_since_wdt = 0;
+            tryboot::watchdog_feed(15);
+        }
+    }
+    true
+}
+
+// ─── AI / AXI DMP Wrapper Core Reset Helpers (`ARMCM3 = 0x1810_3000`, `SOCSRAM = 0x1810_4000`) ───
+
+const AI_IOCTRL_OFFSET: u32 = 0x408;
+const AI_RESETCTRL_OFFSET: u32 = 0x800;
+const SICF_CLOCK_EN: u32 = 0x01;
+const SICF_FGC: u32 = 0x02;
+
+unsafe fn ai_core_disable(wrapper_base: u32) {
+    let resetctrl = backplane_read32(wrapper_base + AI_RESETCTRL_OFFSET);
+    if (resetctrl & 1) != 0 {
+        return;
+    }
+    backplane_write32(wrapper_base + AI_IOCTRL_OFFSET, 0);
+    let _ = backplane_read32(wrapper_base + AI_IOCTRL_OFFSET);
+    timer::delay_ms(1);
+    backplane_write32(wrapper_base + AI_RESETCTRL_OFFSET, 1);
+    let _ = backplane_read32(wrapper_base + AI_RESETCTRL_OFFSET);
+    timer::delay_ms(1);
+}
+
+unsafe fn ai_core_reset(wrapper_base: u32, ioctl_flags: u32, reset_flags: u32) {
+    ai_core_disable(wrapper_base);
+    backplane_write32(
+        wrapper_base + AI_IOCTRL_OFFSET,
+        SICF_FGC | SICF_CLOCK_EN | reset_flags,
+    );
+    let _ = backplane_read32(wrapper_base + AI_IOCTRL_OFFSET);
+    backplane_write32(wrapper_base + AI_RESETCTRL_OFFSET, 0);
+    let _ = backplane_read32(wrapper_base + AI_RESETCTRL_OFFSET);
+    timer::delay_ms(1);
+    backplane_write32(wrapper_base + AI_IOCTRL_OFFSET, SICF_CLOCK_EN | ioctl_flags);
+    let _ = backplane_read32(wrapper_base + AI_IOCTRL_OFFSET);
+    timer::delay_ms(1);
+}
+
+/// Convert text `brcmfmac43430-sdio.txt` into null-delimited Broadcom NVRAM binary format
+/// with 4-byte alignment + 32-bit trailing length token.
+fn format_nvram_image(raw_txt: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut out = alloc::vec::Vec::with_capacity(raw_txt.len() + 16);
+    if let Ok(s) = core::str::from_utf8(raw_txt) {
+        for line in s.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            out.extend_from_slice(trimmed.as_bytes());
+            out.push(0);
+        }
+    }
+    out.push(0);
+    while (out.len() & 3) != 0 {
+        out.push(0);
+    }
+    let words = (out.len() / 4) as u32;
+    let token = ((!words & 0xFFFF) << 16) | (words & 0xFFFF);
+    out.extend_from_slice(&token.to_le_bytes());
+    out
+}
+
+static mut CDC_REQ_ID: u16 = 1;
+
+/// Send a Broadcom `SDPCM` (Channel 0) + `CDC` (`cdc_ioctl`) control command over Function 2.
+unsafe fn sdpcm_cdc_ioctl(set: bool, cmd: u32, payload: &[u8]) -> bool {
+    if payload.len() > 460 {
+        return false;
+    }
+    let seq = SDPCM_TX_SEQ;
+    SDPCM_TX_SEQ = SDPCM_TX_SEQ.wrapping_add(1);
+    let req_id = CDC_REQ_ID;
+    CDC_REQ_ID = CDC_REQ_ID.wrapping_add(1).max(1);
+
+    let total_len = 12 + 16 + payload.len();
+    let padded_len = (total_len + 3) & !3;
+    let len_u16 = total_len as u16;
+    let not_len = !len_u16;
+
+    let mut pkt = [0u8; 512];
+    // 12-byte SDPCM Header (Channel 0 = Control)
+    pkt[0..2].copy_from_slice(&len_u16.to_le_bytes());
+    pkt[2..4].copy_from_slice(&not_len.to_le_bytes());
+    pkt[4] = seq;
+    pkt[5] = 0x00; // Channel 0 = Control (CDC)
+    pkt[6] = 0x00;
+    pkt[7] = 12; // Header length = 12
+    pkt[8..12].copy_from_slice(&[0, 0, 0, 0]);
+
+    // 16-byte CDC Header
+    let flags: u32 = (if set { 0x0002 } else { 0x0000 }) | ((req_id as u32) << 16);
+    pkt[12..16].copy_from_slice(&cmd.to_le_bytes());
+    pkt[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    pkt[20..24].copy_from_slice(&flags.to_le_bytes());
+    pkt[24..28].copy_from_slice(&0u32.to_le_bytes());
+    pkt[28..28 + payload.len()].copy_from_slice(payload);
+
+    let ok = sdio_cmd53_write(2, 0x0000, true, &pkt[..padded_len]).is_ok();
+    // Drain up to 2 pending CDC response/event frames from Function 2
+    let mut rx_tmp = [0u8; 128];
+    for _ in 0..2 {
+        timer::delay_ms(2);
+        let mut hdr = [0u8; 4];
+        if sdio_cmd53_read(2, 0x0000, false, &mut hdr).is_ok() {
+            let rlen = u16::from_le_bytes([hdr[0], hdr[1]]) as usize;
+            let rchk = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
+            if rlen >= 12 && rlen <= 512 && (rlen ^ rchk) == 0xFFFF {
+                let rpad = ((rlen + 3) & !3).min(rx_tmp.len());
+                let _ = sdio_cmd53_read(2, 0x0000, false, &mut rx_tmp[..rpad]);
+            }
+        }
+    }
+    ok
+}
+
+unsafe fn sdpcm_set_u32(cmd: u32, val: u32) -> bool {
+    sdpcm_cdc_ioctl(true, cmd, &val.to_le_bytes())
+}
+
+unsafe fn sdpcm_set_iovar(name: &str, val: &[u8]) -> bool {
+    let nb = name.as_bytes();
+    if nb.len() + 1 + val.len() > 256 {
+        return false;
+    }
+    let mut buf = [0u8; 256];
+    buf[..nb.len()].copy_from_slice(nb);
+    buf[nb.len()] = 0;
+    let total = nb.len() + 1 + val.len();
+    buf[nb.len() + 1..total].copy_from_slice(val);
+    sdpcm_cdc_ioctl(true, 263, &buf[..total]) // WLC_SET_VAR = 263
+}
+
+/// Upload `FW43430.BIN` + `FW43430.TXT` into `BCM43430B0` Chip RAM, boot the internal
+/// ARM Cortex-M3 wireless core (`0x1810_3000`), enable Function 2 (`SDPCM`), and associate
+/// with the user's WPA2-PSK Wi-Fi router (`ssid`, `pass`).
+pub fn upload_firmware_and_associate(
+    fw_bin: Option<&[u8]>,
+    nvram_txt: Option<&[u8]>,
+    ssid: Option<&str>,
+    pass: Option<&str>,
+) -> bool {
+    if bsp::is_qemu() {
+        return true;
+    }
+    let st = status();
+    if !st.initialized {
+        return false;
+    }
+
+    let ok = unsafe {
+        route_emmc_to_wifi_sdio();
+        let c1 = mmio::read(EMMC_CONTROL1) & !(0xFF << 8);
+        mmio::write(EMMC_CONTROL1, c1 | (0x02 << 8));
+        BACKPLANE_WINDOW = u32::MAX;
+
+        // Re-select SDIO card RCA if needed
+        let _ = sdio_send_cmd(CMD7_SELECT_CARD, (st.sdio_rca as u32) << 16);
+        let _ = sdio_cmd52(true, 0, 0x00110, 64);
+        let _ = sdio_cmd52(true, 0, 0x00111, 0);
+        let _ = sdio_cmd52(true, 0, 0x00210, 0x00);
+        let _ = sdio_cmd52(true, 0, 0x00211, 0x02);
+        let _ = sdio_cmd52(true, 0, 0x00002, 0x02); // Enable F1
+
+        // 1. Request ALP clock (SBSDIO_FUNC1_CHIPCLKCSR = 0x1000E <- 0x08)
+        let _ = sdio_cmd52(true, 1, 0x1000E, 0x08);
+        for _ in 0..25 {
+            if (sdio_cmd52(false, 1, 0x1000E, 0).unwrap_or(0) & 0x40) != 0 {
+                break;
+            }
+            timer::delay_ms(2);
+        }
+
+        let mut f2_rdy = st.f2_ready;
+        if let (Some(fw), Some(nv_raw)) = (fw_bin, nvram_txt) {
+            if !fw.is_empty() && !nv_raw.is_empty() {
+                // 2. Disable ARMCM3 (0x1810_3000) & Reset SOCSRAM (0x1810_4000)
+                ai_core_disable(0x1810_3000);
+                ai_core_reset(0x1810_4000, 0, 0);
+                backplane_write32(0x1800_4010, 3);
+                backplane_write32(0x1800_4044, 0);
+
+                // 3. Upload Firmware Binary (`~380 KB`) to Chip RAM at `0x0000_0000`
+                let fw_ok = backplane_write_ram(0x0000_0000, fw);
+
+                // 4. Format & Upload NVRAM to top of 512 KB Chip RAM (`0x0008_0000 - nv.len()`)
+                let nv_img = format_nvram_image(nv_raw);
+                let nv_addr = 0x0008_0000u32.saturating_sub(nv_img.len() as u32);
+                let nv_ok = backplane_write_ram(nv_addr, &nv_img);
+
+                // Restore reset vector at 0x0000_0000
+                if fw.len() >= 4 {
+                    let vec0 = u32::from_le_bytes([fw[0], fw[1], fw[2], fw[3]]);
+                    backplane_write32(0x0000_0000, vec0);
+                }
+
+                // 5. Bring ARMCM3 (0x1810_3000) out of reset!
+                ai_core_reset(0x1810_3000, 0, 0);
+
+                // 6. Wait for HT Clock (0x80) on 0x1000E and Enable Function 2 (CCCR 0x02 = 0x06)
+                let _ = sdio_cmd52(true, 1, 0x1000E, 0x10);
+                for _ in 0..60 {
+                    if (sdio_cmd52(false, 1, 0x1000E, 0).unwrap_or(0) & 0x80) != 0 {
+                        break;
+                    }
+                    timer::delay_ms(3);
+                }
+
+                let _ = sdio_cmd52(true, 0, 0x00002, 0x06); // Enable F1 + F2
+                for _ in 0..100 {
+                    if let Ok(rdy) = sdio_cmd52(false, 0, 0x00003, 0) {
+                        if (rdy & 0x04) != 0 {
+                            f2_rdy = true;
+                            break;
+                        }
+                    }
+                    timer::delay_ms(4);
+                }
+                let _ = sdio_cmd52(true, 0, 0x00004, 0x07); // Enable F1+F2 IRQs
+                backplane_write32(0x1800_2020, 0xFFFF_FFFF);
+                tryboot::watchdog_feed(15);
+
+                crate::println!(
+                    "[OK] Wi-Fi FW loaded: fw={}KB (ok={}), nvram={}B (ok={}), F2_READY={}",
+                    fw.len() / 1024,
+                    fw_ok,
+                    nv_img.len(),
+                    nv_ok,
+                    f2_rdy
+                );
+            }
+        }
+
+        // 7. If Function 2 is ready and SSID/Passphrase are provided, run WPA2-PSK association
+        let mut assoc_sent = false;
+        if f2_rdy {
+            if let (Some(ssid_str), Some(pass_str)) = (ssid, pass) {
+                if !ssid_str.is_empty() {
+                    timer::delay_ms(20);
+                    let mut ccode = [0u8; 12];
+                    ccode[0] = b'C';
+                    ccode[1] = b'N';
+                    ccode[8] = b'C';
+                    ccode[9] = b'N';
+                    let _ = sdpcm_set_iovar("country", &ccode);
+                    let _ = sdpcm_set_u32(2, 0); // WLC_UP = 2
+                    let _ = sdpcm_set_u32(20, 1); // WLC_SET_INFRA = 20 (STA = 1)
+                    let _ = sdpcm_set_u32(22, 0); // WLC_SET_AUTH = 22 (Open = 0)
+                    let _ = sdpcm_set_u32(134, 4); // WLC_SET_WSEC = 134 (AES = 4)
+                    let _ = sdpcm_set_iovar("bsscfg:sup_wpa", &[0, 0, 0, 0, 1, 0, 0, 0]);
+                    let _ = sdpcm_set_u32(165, 0x80); // WLC_SET_WPA_AUTH = 165 (WPA2-PSK = 0x80)
+
+                    // WLC_SET_WSEC_PMK = 268 (wsec_pmk_t: key_len u16, flags u16 = 1, key[64])
+                    let pb = pass_str.as_bytes();
+                    let klen = pb.len().min(64);
+                    let mut pmk = [0u8; 68];
+                    pmk[0..2].copy_from_slice(&(klen as u16).to_le_bytes());
+                    pmk[2..4].copy_from_slice(&1u16.to_le_bytes()); // WSEC_PASSPHRASE = 1
+                    pmk[4..4 + klen].copy_from_slice(&pb[..klen]);
+                    let _ = sdpcm_cdc_ioctl(true, 268, &pmk);
+
+                    // WLC_SET_SSID = 26 (wlc_ssid_t: ssid_len u32, ssid[32])
+                    let sb = ssid_str.as_bytes();
+                    let slen = sb.len().min(32);
+                    let mut ssid_pkt = [0u8; 36];
+                    ssid_pkt[0..4].copy_from_slice(&(slen as u32).to_le_bytes());
+                    ssid_pkt[4..4 + slen].copy_from_slice(&sb[..slen]);
+                    assoc_sent = sdpcm_cdc_ioctl(true, 26, &ssid_pkt);
+                }
+            }
+        }
+
+        STATE.with(|s| {
+            s.f2_ready = f2_rdy;
+            s.link_up = f2_rdy;
+        });
+
+        let _ = block::sd::init();
+        if assoc_sent {
+            crate::println!(
+                "[OK] Wi-Fi WPA2-PSK association triggered for SSID={:?} (F2={})",
+                ssid.unwrap_or(""),
+                f2_rdy
+            );
+        }
+        f2_rdy
+    };
+    ok
+}
+
 /// Run the `CMD5 -> CMD3 -> CMD7` SDIO enumeration sequence and return `(rca, num_funcs)`.
 unsafe fn enumerate_sdio_bus() -> Option<(u16, u8)> {
     let _ = sdio_send_cmd(CMD5_IO_SEND_OP_COND, 0);

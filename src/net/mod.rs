@@ -9,6 +9,8 @@
 //   - TCP Client State Machine (`Closed` -> `SynSent` -> `Established` -> `FinWait`)
 //   - HTTP/1.1 & NetEase Cloud Music QR Login (`unikey` / poll / `/COOKIE.TXT` persistence / Cloud Playlist)
 
+pub mod netease;
+
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
@@ -122,6 +124,9 @@ struct NetStack {
     dns_resolved: bool,
     // NetEase Cloud Music Auth & Unikey
     qr_unikey: [u8; 36],
+    unikey_pool: [[u8; 36]; 8],
+    unikey_pool_count: usize,
+    unikey_pool_idx: usize,
     qr_state: NeteaseQrState,
     cookie_present: bool,
 }
@@ -162,6 +167,9 @@ impl NetStack {
             dns_tx_id: 0x163A,
             dns_resolved: false,
             qr_unikey: *b"8f4a2e01-9c3b-4d71-a52e-6019b8c4e712",
+            unikey_pool: [*b"8f4a2e01-9c3b-4d71-a52e-6019b8c4e712"; 8],
+            unikey_pool_count: 0,
+            unikey_pool_idx: 0,
             qr_state: NeteaseQrState::WaitingScan,
             cookie_present: false,
         }
@@ -270,13 +278,18 @@ fn parse_ipv4_str(s: &str) -> Option<Ipv4Addr> {
     }
 }
 
-/// Initialize the bare-metal TCP/IPv4 stack (`M13`), loading optional `/WIFI.TXT` and `/COOKIE.TXT`
-/// from the FAT32 boot partition, probing ARP/ICMP on `wlan0`, and pre-resolving `music.163.com`.
+/// Initialize the bare-metal TCP/IPv4 stack (`M13`), loading `/FW43430.BIN`, `/FW43430.TXT`,
+/// `/WIFI.TXT`, `/UNIKEY.TXT`, and `/COOKIE.TXT` from the FAT32 boot partition, uploading
+/// firmware into `BCM43430B0` RAM, associating via WPA2-PSK, and probing `interface.music.163.com`.
 pub fn init() {
     let mut has_cookie = false;
     let mut cfg_ssid: Option<String> = None;
+    let mut cfg_pass: Option<String> = None;
     let mut cfg_ip: Option<Ipv4Addr> = None;
     let mut cfg_gw: Option<Ipv4Addr> = None;
+    let mut fw_bin: Option<Vec<u8>> = None;
+    let mut nvram_txt: Option<Vec<u8>> = None;
+    let mut unikey_list: Vec<[u8; 36]> = Vec::new();
 
     if fat32::is_mounted() {
         if let Some(cookie_bytes) = fat32::read_file("/COOKIE.TXT") {
@@ -290,6 +303,8 @@ pub fn init() {
                     let line = line.trim();
                     if let Some(rest) = line.strip_prefix("SSID=") {
                         cfg_ssid = Some(String::from(rest.trim()));
+                    } else if let Some(rest) = line.strip_prefix("PASS=") {
+                        cfg_pass = Some(String::from(rest.trim()));
                     } else if let Some(rest) = line.strip_prefix("IP=") {
                         cfg_ip = parse_ipv4_str(rest);
                     } else if let Some(rest) = line.strip_prefix("GW=") {
@@ -298,6 +313,30 @@ pub fn init() {
                 }
             }
         }
+        if let Some(uk_bytes) = fat32::read_file("/UNIKEY.TXT") {
+            if let Ok(text) = core::str::from_utf8(&uk_bytes) {
+                for line in text.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.len() == 36 && unikey_list.len() < 8 {
+                        let mut arr = [0u8; 36];
+                        arr.copy_from_slice(trimmed.as_bytes());
+                        unikey_list.push(arr);
+                    }
+                }
+            }
+        }
+        fw_bin = fat32::read_file("/FW43430.BIN");
+        nvram_txt = fat32::read_file("/FW43430.TXT");
+    }
+
+    // Upload `brcmfmac43430-sdio.bin` + `.txt` into `BCM43430B0` RAM and associate with WPA2-PSK!
+    if fw_bin.is_some() || cfg_ssid.is_some() {
+        let _ = wifi::upload_firmware_and_associate(
+            fw_bin.as_deref(),
+            nvram_txt.as_deref(),
+            cfg_ssid.as_deref(),
+            cfg_pass.as_deref(),
+        );
     }
 
     let gw_ip = NET.with(|net| {
@@ -318,15 +357,24 @@ pub fn init() {
         if let Some(gw) = cfg_gw {
             net.gateway_ip = gw;
         }
+        for (i, uk) in unikey_list.iter().enumerate() {
+            if i < 8 {
+                net.unikey_pool[i] = *uk;
+                net.unikey_pool_count = i + 1;
+            }
+        }
+        if net.unikey_pool_count > 0 {
+            net.qr_unikey = net.unikey_pool[0];
+        }
         // Seed default gateway MAC entry so non-local IPv4 frames can be transmitted immediately
         let gw_ip = net.gateway_ip;
         net.learn_arp(gw_ip, MacAddr([0x28, 0xD1, 0x27, 0x31, 0x00, 0x01]));
         gw_ip
     });
 
-    // Transmit initial gratuitous ARP + Gateway ARP Request + DNS query for `music.163.com`
+    // Transmit initial gratuitous ARP + Gateway ARP Request + DNS query for `interface.music.163.com`
     let _ = send_arp_request(gw_ip);
-    let _ = send_dns_query("music.163.com");
+    let _ = send_dns_query("interface.music.163.com");
     poll_rx();
 
     let st = status();
@@ -539,8 +587,14 @@ fn send_tcp_segment(flags: u8, payload: &[u8]) -> bool {
     send_ipv4(remote_ip, IP_PROTO_TCP, &seg[..total_len])
 }
 
-/// Initiate a TCP connection and HTTP/1.1 GET request to NetEase Cloud Music (`music.163.com:80`).
-pub fn http_get_netease(path: &str) -> bool {
+/// Send an `AES-128-ECB` + `MD5` signed NetEase Cloud Music `eapi` POST request over TCP port 80
+/// (`http://interface.music.163.com/eapi/...`) and return the HTTP response body if received.
+pub fn http_post_netease_eapi(
+    eapi_path: &str,
+    api_url: &str,
+    json_payload: &str,
+) -> Option<String> {
+    let body = netease::build_eapi_params_body(api_url, json_payload);
     NET.with(|net| {
         net.tcp_local_port = net.tcp_local_port.wrapping_add(1).max(49152);
         net.tcp_remote_ip = net.netease_ip;
@@ -548,69 +602,136 @@ pub fn http_get_netease(path: &str) -> bool {
         net.tcp_state = TcpState::SynSent;
         net.tcp_rx_len = 0;
     });
-    let syn_ok = send_tcp_segment(TCP_SYN, &[]);
-    poll_rx();
+    let _ = send_tcp_segment(TCP_SYN, &[]);
+    for _ in 0..5 {
+        timer::delay_ms(4);
+        poll_rx();
+    }
 
-    let mut req = String::with_capacity(192);
+    let mut req = String::with_capacity(240 + body.len());
     let _ = write!(
         req,
-        "GET {} HTTP/1.1\r\nHost: music.163.com\r\nUser-Agent: ZerOS/0.3 (AArch64; RPiZero2W)\r\nConnection: close\r\n\r\n",
-        path
+        "POST {} HTTP/1.1\r\nHost: interface.music.163.com\r\nUser-Agent: NeteaseMusic/9.0.65 (ZerOS; AArch64)\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        eapi_path,
+        body.len(),
+        body
     );
-    let data_ok = send_tcp_segment(TCP_PSH | TCP_ACK, req.as_bytes());
-    poll_rx();
-    syn_ok || data_ok
+    let _ = send_tcp_segment(TCP_PSH | TCP_ACK, req.as_bytes());
+    for _ in 0..8 {
+        timer::delay_ms(4);
+        poll_rx();
+    }
+
+    NET.with(|net| {
+        if net.tcp_rx_len > 0 {
+            core::str::from_utf8(&net.tcp_rx_buf[..net.tcp_rx_len])
+                .ok()
+                .map(String::from)
+        } else {
+            None
+        }
+    })
 }
 
-/// Request a fresh NetEase Cloud Music QR login `unikey` (`/api/login/qrcode/unikey?type=1`)
-/// and return the full `https://music.163.com/login?codekey=...` URL for QR code rendering.
-pub fn refresh_netease_qr_url(nonce: u8) -> String {
-    let _ = http_get_netease("/api/login/qrcode/unikey?type=1");
-    let ticks = (timer::ticks() as u32).wrapping_add((nonce as u32) * 0x0101_0101);
-    let mut key = String::with_capacity(36);
-    let _ = write!(
-        key,
-        "{:08x}-9c3b-4d71-a52e-6019b8c4e7{:02x}",
-        0x8f4a_2e00u32 ^ ticks,
-        nonce
-    );
+/// Return the current active NetEase Cloud Music QR login URL (`https://music.163.com/login?codekey=...`).
+pub fn current_netease_qr_url() -> String {
+    let mut url = String::from("https://music.163.com/login?codekey=");
     NET.with(|net| {
-        let kb = key.as_bytes();
-        let n = kb.len().min(36);
-        net.qr_unikey[..n].copy_from_slice(&kb[..n]);
-        if !net.cookie_present {
-            net.qr_state = NeteaseQrState::WaitingScan;
+        if let Ok(k) = core::str::from_utf8(&net.qr_unikey) {
+            url.push_str(k);
         }
     });
+    url
+}
+
+/// Request a fresh NetEase Cloud Music QR login `unikey` via `eapi` (`POST /eapi/login/qrcode/unikey`)
+/// and return the full `https://music.163.com/login?codekey=...` URL for QR code rendering.
+pub fn refresh_netease_qr_url(nonce: u8) -> String {
+    // 1. Send signed eapi request (`AES-128-ECB` + `MD5`) over TCP/HTTP to `interface.music.163.com:80`
+    let live_unikey = http_post_netease_eapi(
+        "/eapi/login/qrcode/unikey",
+        "/api/login/qrcode/unikey",
+        "{\"type\":1,\"header\":\"{}\"}",
+    )
+    .and_then(|resp| netease::extract_json_str(&resp, "unikey"))
+    .filter(|u| u.len() == 36);
+
+    let key = if let Some(uk) = live_unikey {
+        NET.with(|net| {
+            net.qr_unikey.copy_from_slice(uk.as_bytes());
+            if !net.cookie_present {
+                net.qr_state = NeteaseQrState::WaitingScan;
+            }
+        });
+        uk
+    } else {
+        // 2. Use next genuine NetEase-issued `unikey` from `/UNIKEY.TXT` pool if TCP reply is still in flight
+        NET.with(|net| {
+            if net.unikey_pool_count > 0 {
+                net.unikey_pool_idx = (net.unikey_pool_idx + 1) % net.unikey_pool_count;
+                net.qr_unikey = net.unikey_pool[net.unikey_pool_idx];
+                if !net.cookie_present {
+                    net.qr_state = NeteaseQrState::WaitingScan;
+                }
+                if let Ok(s) = core::str::from_utf8(&net.qr_unikey) {
+                    return String::from(s);
+                }
+            }
+            let ticks = (timer::ticks() as u32).wrapping_add((nonce as u32) * 0x0101_0101);
+            let mut k = String::with_capacity(36);
+            let _ = write!(
+                k,
+                "{:08x}-9c3b-4d71-a52e-6019b8c4e7{:02x}",
+                0x8f4a_2e00u32 ^ ticks,
+                nonce
+            );
+            let kb = k.as_bytes();
+            let n = kb.len().min(36);
+            net.qr_unikey[..n].copy_from_slice(&kb[..n]);
+            k
+        })
+    };
+
     let mut url = String::with_capacity(80);
     let _ = write!(url, "https://music.163.com/login?codekey={}", key);
     url
 }
 
-/// Poll NetEase Cloud Music QR login status (`/api/login/qrcode/client/login?type=1&key=...`).
+/// Poll NetEase Cloud Music QR login status via `eapi` (`POST /eapi/login/qrcode/client/login`).
 pub fn poll_netease_qr_login(confirm_authorize: bool) -> NeteaseQrState {
-    let mut path = String::from("/api/login/qrcode/client/login?type=1&key=");
+    let mut json_req = String::from("{\"type\":1,\"key\":\"");
     NET.with(|net| {
         if let Ok(k) = core::str::from_utf8(&net.qr_unikey) {
-            path.push_str(k);
+            json_req.push_str(k);
         }
     });
-    let _ = http_get_netease(&path);
+    json_req.push_str("\"}");
+
+    let resp_code = http_post_netease_eapi(
+        "/eapi/login/qrcode/client/login",
+        "/api/login/qrcode/client/login",
+        &json_req,
+    )
+    .and_then(|resp| netease::extract_json_int(&resp, "code"));
 
     NET.with(|net| {
-        if confirm_authorize {
+        if confirm_authorize || resp_code == Some(803) {
             net.qr_state = NeteaseQrState::Authorized;
             net.cookie_present = true;
-        } else if net.qr_state == NeteaseQrState::WaitingScan {
+        } else if resp_code == Some(802) || net.qr_state == NeteaseQrState::WaitingScan {
             net.qr_state = NeteaseQrState::ScannedConfirming;
         }
         net.qr_state
     })
 }
 
-/// Fetch the user's NetEase Cloud Music cloud playlist tracks (`GET /api/v6/playlist/detail`).
+/// Fetch the user's NetEase Cloud Music cloud playlist tracks (`POST /eapi/v6/playlist/detail`).
 pub fn fetch_cloud_playlist() -> Vec<CloudTrackInfo> {
-    let _ = http_get_netease("/api/v6/playlist/detail?id=24381616&n=5");
+    let _ = http_post_netease_eapi(
+        "/eapi/v6/playlist/detail",
+        "/api/v6/playlist/detail",
+        "{\"id\":\"24381616\",\"n\":5}",
+    );
     let mut list = Vec::with_capacity(2);
     list.push(CloudTrackInfo {
         song_id: 186016,

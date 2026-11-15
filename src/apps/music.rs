@@ -211,9 +211,7 @@ impl MusicApp {
             show_qr_login: false,
             header_dirty: false,
             qr_nonce: 1,
-            qr_url: String::from(
-                "https://music.163.com/login?codekey=8f4a2e01-9c3b-4d71-a52e-6019b8c4e712",
-            ),
+            qr_url: net::current_netease_qr_url(),
             netease_logged_in: has_cookie,
             cloud_tracks_loaded: false,
             playlist_cursor: 0,
@@ -725,7 +723,7 @@ impl App for MusicApp {
                         self.activate_current_track();
                         AppIntent::None
                     } else if self.playlist_cursor == self.tracks.len() {
-                        self.qr_url = net::refresh_netease_qr_url(self.qr_nonce);
+                        self.qr_url = net::current_netease_qr_url();
                         self.show_qr_login = true;
                         AppIntent::None
                     } else {
