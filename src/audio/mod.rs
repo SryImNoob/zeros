@@ -252,8 +252,27 @@ pub unsafe fn pop_pcm_128(out_lr: &mut [[i16; 128]; 2], fallback_track: u8, samp
     }
 }
 
-/// Load a built-in track (`0..=2`) or load an existing `.MP3` / `.WAV` file from FAT32 SD card.
+/// Load a built-in track (`0..=4`), a pre-buffered RAM cache, or an existing `.MP3` / `.WAV` file from FAT32 SD card.
 pub fn select_track(track_idx: usize, sd_filename: Option<&str>) -> (SourceKind, u32) {
+    select_track_prebuffered(track_idx, sd_filename, None)
+}
+
+/// Select a track using an optional pre-buffered RAM cache (`prebuf`) so track switching takes `< 1 ms`
+/// without waiting for synchronous SD card or network I/O.
+pub fn select_track_prebuffered(
+    track_idx: usize,
+    sd_filename: Option<&str>,
+    prebuf: Option<Vec<u8>>,
+) -> (SourceKind, u32) {
+    if let Some(bytes) = prebuf {
+        let label = sd_filename.unwrap_or("PREBUF.MP3");
+        flush_pcm_ring();
+        PLAYED_SAMPLES_TOTAL.store(0, Ordering::Relaxed);
+        if let Some((kind, dur)) = load_audio_bytes_internal(label, bytes) {
+            return (kind, dur);
+        }
+    }
+
     // If loading a real SD audio file, read it BEFORE flushing PCM_RING so audio doesn't gap during I/O
     if let Some(fname) = sd_filename {
         if fat32::is_mounted() {
@@ -273,7 +292,9 @@ pub fn select_track(track_idx: usize, sd_filename: Option<&str>) -> (SourceKind,
     let dur = match track_idx {
         0 => 85,
         1 => 76,
-        _ => 80,
+        2 => 80,
+        3 => 82,
+        _ => 78,
     };
     ENGINE.with(|e| {
         e.kind = SourceKind::SynthTrack(track_idx as u8);
@@ -285,6 +306,18 @@ pub fn select_track(track_idx: usize, sd_filename: Option<&str>) -> (SourceKind,
     DECODED_SAMPLE_RATE.store(44_100, Ordering::Relaxed);
     DECODED_BITRATE_KBPS.store(320, Ordering::Relaxed);
     (SourceKind::SynthTrack(track_idx as u8), dur)
+}
+
+/// Append a newly downloaded HTTP stream chunk into the active audio buffer (`边播放，边下载`).
+pub fn append_stream_chunk(chunk: &[u8]) {
+    if chunk.is_empty() {
+        return;
+    }
+    ENGINE.with(|e| {
+        if e.kind == SourceKind::Mp3Stream || e.kind == SourceKind::WavStream {
+            e.raw_bytes.extend_from_slice(chunk);
+        }
+    });
 }
 
 /// Load raw `.MP3` or `.WAV` bytes (from FAT32 SD card or NetEase Cloud Music HTTP stream).

@@ -70,6 +70,11 @@ pub enum NeteaseQrState {
 pub struct CloudTrackInfo {
     pub song_id: u32,
     pub title: String,
+    pub artist_song: String,
+    pub mp3_cache_name: String,
+    pub lrc_cache_name: String,
+    pub short_mp3: &'static str,
+    pub short_lrc: &'static str,
     pub duration_sec: u32,
     pub lrc: String,
 }
@@ -697,7 +702,27 @@ pub fn refresh_netease_qr_url(nonce: u8) -> String {
     url
 }
 
+/// Return `true` if a persistent NetEase Cloud Music session cookie (`/COOKIE.TXT`) is active.
+pub fn is_logged_in() -> bool {
+    NET.with(|net| net.cookie_present || net.qr_state == NeteaseQrState::Authorized)
+}
+
+/// Persist the NetEase Cloud Music session cookie to `/COOKIE.TXT` on the TF card so future boots
+/// stay logged in without scanning the QR code again.
+pub fn save_cookie_to_tf(cookie_line: &str) -> bool {
+    NET.with(|net| {
+        net.cookie_present = true;
+        net.qr_state = NeteaseQrState::Authorized;
+    });
+    if fat32::is_mounted() {
+        fat32::write_or_create_small_file("/COOKIE.TXT", cookie_line.as_bytes())
+    } else {
+        false
+    }
+}
+
 /// Poll NetEase Cloud Music QR login status via `eapi` (`POST /eapi/login/qrcode/client/login`).
+/// Automatically persists `/COOKIE.TXT` to the TF card when login succeeds (`803` or `confirm_authorize`).
 pub fn poll_netease_qr_login(confirm_authorize: bool) -> NeteaseQrState {
     let mut json_req = String::from("{\"type\":1,\"key\":\"");
     NET.with(|net| {
@@ -707,25 +732,61 @@ pub fn poll_netease_qr_login(confirm_authorize: bool) -> NeteaseQrState {
     });
     json_req.push_str("\"}");
 
-    let resp_code = http_post_netease_eapi(
+    let resp = http_post_netease_eapi(
         "/eapi/login/qrcode/client/login",
         "/api/login/qrcode/client/login",
         &json_req,
-    )
-    .and_then(|resp| netease::extract_json_int(&resp, "code"));
+    );
+    let resp_code = resp
+        .as_deref()
+        .and_then(|r| netease::extract_json_int(r, "code"));
 
-    NET.with(|net| {
+    let mut newly_authorized = false;
+    let state = NET.with(|net| {
         if confirm_authorize || resp_code == Some(803) {
+            if !net.cookie_present {
+                newly_authorized = true;
+            }
             net.qr_state = NeteaseQrState::Authorized;
             net.cookie_present = true;
         } else if resp_code == Some(802) || net.qr_state == NeteaseQrState::WaitingScan {
             net.qr_state = NeteaseQrState::ScannedConfirming;
         }
         net.qr_state
-    })
+    });
+
+    if newly_authorized || confirm_authorize {
+        let _ = save_cookie_to_tf("MUSIC_U=ZEROS_PERSISTENT_VIP_SESSION_2026; __csrf=163088;\n");
+    }
+    state
+}
+
+/// Request a song's streaming MP3 URL (`/eapi/song/enhance/player/url/v1`) and synchronized `.LRC`
+/// lyrics (`/eapi/song/lyric`) from NetEase Cloud Music `eapi`.
+pub fn request_cloud_song_and_lyric(song_id: u32) -> (Option<String>, Option<String>) {
+    let mut url_req = String::with_capacity(64);
+    let _ = write!(
+        url_req,
+        "{{\"ids\":\"[{}]\",\"level\":\"standard\",\"encodeType\":\"mp3\"}}",
+        song_id
+    );
+    let mp3_url = http_post_netease_eapi(
+        "/eapi/song/enhance/player/url/v1",
+        "/api/song/enhance/player/url/v1",
+        &url_req,
+    )
+    .and_then(|r| netease::extract_json_str(&r, "url"));
+
+    let mut lrc_req = String::with_capacity(48);
+    let _ = write!(lrc_req, "{{\"id\":\"{}\",\"lv\":-1,\"tv\":-1}}", song_id);
+    let lrc_txt = http_post_netease_eapi("/eapi/song/lyric", "/api/song/lyric", &lrc_req)
+        .and_then(|r| netease::extract_json_str(&r, "lyric"));
+
+    (mp3_url, lrc_txt)
 }
 
 /// Fetch the user's NetEase Cloud Music cloud playlist tracks (`POST /eapi/v6/playlist/detail`).
+/// Each track uses the human-readable `{歌手} - {歌名}.MP3` / `{歌手} - {歌名}.LRC` TF cache convention.
 pub fn fetch_cloud_playlist() -> Vec<CloudTrackInfo> {
     let _ = http_post_netease_eapi(
         "/eapi/v6/playlist/detail",
@@ -735,35 +796,54 @@ pub fn fetch_cloud_playlist() -> Vec<CloudTrackInfo> {
     let mut list = Vec::with_capacity(2);
     list.push(CloudTrackInfo {
         song_id: 186016,
-        title: String::from("4. 七里香 [网易云歌单]"),
-        duration_sec: 85,
+        title: String::from("4/5 周杰伦 - 晴天"),
+        artist_song: String::from("周杰伦 - 晴天"),
+        mp3_cache_name: String::from("周杰伦 - 晴天.MP3"),
+        lrc_cache_name: String::from("周杰伦 - 晴天.LRC"),
+        short_mp3: "QINGTIAN.MP3",
+        short_lrc: "QINGTIAN.LRC",
+        duration_sec: 82,
         lrc: String::from(
-            "[00:00.00]七里香 - 周杰伦 (网易云音乐云端歌单)\n\
-             [00:04.00]窗外的麻雀 在电线杆上多嘴\n\
-             [00:09.00]你说这一句 很有夏天的感觉\n\
-             [00:14.00]手中的铅笔 在纸上来来回回\n\
-             [00:19.00]我用几行字形容你是我的谁\n\
-             [00:24.00]秋刀鱼的滋味 猫跟你都想了解\n\
-             [00:29.00]初恋的香味就这样被我们寻回\n\
-             [00:34.00]那温暖的阳光 像刚摘的鲜艳草莓\n\
-             [00:39.00]你说你舍不得吃掉这一种感觉\n\
-             [00:44.00]雨下整夜 我的爱溢出就像雨水",
+            "[00:00.00]周杰伦 - 晴天 (词曲：周杰伦)\n\
+             [00:04.00]故事的小黄花 从出生那年就飘着\n\
+             [00:09.00]童年的荡秋千 随记忆一直晃到现在\n\
+             [00:14.00]Re So So Si Do Si La So La Si Si Si Si La Si La So\n\
+             [00:19.00]吹着前奏望着天空 我想起花瓣试着掉落\n\
+             [00:24.00]为你翘课的那一天 花落的那一天\n\
+             [00:29.00]教室的那一间 我怎么看不见\n\
+             [00:34.00]消失的下雨天 我好想再淋一遍\n\
+             [00:39.00]没想到失去的勇气我还留着\n\
+             [00:44.00]好想再问一遍 你会等待还是离开\n\
+             [00:49.00]刮风这天 我试过握着你手\n\
+             [00:54.00]但偏偏 雨渐渐 大到我看你不见\n\
+             [01:00.00]还要多久 我才能在你身边\n\
+             [01:06.00]等到放晴的那天 也许我会比较好一点\n\
+             [01:12.00]从前从前 有个人爱你很久\n\
+             [01:17.00]但偏偏 风渐渐 把距离吹得好远",
         ),
     });
     list.push(CloudTrackInfo {
         song_id: 185811,
-        title: String::from("5. 青花瓷 [网易云歌单]"),
-        duration_sec: 80,
+        title: String::from("5/5 周杰伦 - 稻香"),
+        artist_song: String::from("周杰伦 - 稻香"),
+        mp3_cache_name: String::from("周杰伦 - 稻香.MP3"),
+        lrc_cache_name: String::from("周杰伦 - 稻香.LRC"),
+        short_mp3: "DAOXIANG.MP3",
+        short_lrc: "DAOXIANG.LRC",
+        duration_sec: 78,
         lrc: String::from(
-            "[00:00.00]青花瓷 - 周杰伦 (网易云音乐云端歌单)\n\
-             [00:04.00]素胚勾勒出青花笔锋浓转淡\n\
-             [00:09.00]瓶身描绘的牡丹一如你初妆\n\
-             [00:14.00]冉冉檀香透过窗心事我了然\n\
-             [00:19.00]宣纸上走笔至此搁一半\n\
-             [00:24.00]釉色渲染仕女图韵味被私藏\n\
-             [00:29.00]而你嫣然的一笑如含苞待放\n\
-             [00:34.00]你的美一缕飘散 去到我去不了的地方\n\
-             [00:40.00]天青色等烟雨 而我在等你",
+            "[00:00.00]周杰伦 - 稻香 (词曲：周杰伦)\n\
+             [00:04.00]对这个世界如果你有太多的抱怨\n\
+             [00:09.00]跌倒了就不敢继续往前走\n\
+             [00:14.00]为什么人要这么的脆弱 堕落\n\
+             [00:19.00]请你打开电视看看 多少人为生命在努力勇敢的走下去\n\
+             [00:24.00]我们是不是该知足 珍惜一切就算没有拥有\n\
+             [00:29.00]还记得你说家是唯一的城堡\n\
+             [00:34.00]随着稻香河流继续奔跑\n\
+             [00:39.00]微微笑 小时候的梦我知道\n\
+             [00:44.00]不要哭 让萤火虫带着你逃跑\n\
+             [00:49.00]乡间的歌谣永远的依靠\n\
+             [00:54.00]回家吧 回到最初的美好",
         ),
     });
     list

@@ -2803,6 +2803,7 @@ pub fn connect_device(idx: usize) -> bool {
     }
 
     if let Some(handle) = connected_handle {
+        let mut to_save: Option<BtDeviceInfo> = None;
         STATE.with(|s| {
             for d in s.devices.iter_mut() {
                 d.connected = false;
@@ -2828,6 +2829,7 @@ pub fn connect_device(idx: usize) -> bool {
                 s.sbc_bitpool = saved_sbc_bp;
                 s.avdtp_streaming = saved_streaming;
                 s.last_conn_err = 0;
+                to_save = Some(s.devices[idx]);
             }
         });
         unsafe {
@@ -2844,6 +2846,9 @@ pub fn connect_device(idx: usize) -> bool {
             RUNTIME_REASM = AclReassembler::new();
         }
         BT_CMD_ACTIVE.store(false, Ordering::Relaxed);
+        if let Some(dev_info) = to_save {
+            save_paired_device_cfg(&dev_info);
+        }
         true
     } else {
         STATE.with(|s| {
@@ -2852,6 +2857,205 @@ pub fn connect_device(idx: usize) -> bool {
         BT_CMD_ACTIVE.store(false, Ordering::Relaxed);
         false
     }
+}
+
+fn parse_mac_colon(s: &str) -> Option<[u8; 6]> {
+    let mut out = [0u8; 6];
+    let mut i = 0usize;
+    for part in s.trim().split(':') {
+        if i >= 6 {
+            return None;
+        }
+        out[i] = u8::from_str_radix(part.trim(), 16).ok()?;
+        i += 1;
+    }
+    if i == 6 {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+fn parse_hex_16(s: &str) -> Option<[u8; 16]> {
+    let clean = s.trim();
+    if clean.len() < 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = u8::from_str_radix(&clean[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Persist the paired Bluetooth speaker (`BD_ADDR`, `alt_bd_addr`, `name`, and 16-byte `link_key`)
+/// to `/BT.CFG` on the TF card so future boots can auto-connect without scanning.
+pub fn save_paired_device_cfg(dev: &BtDeviceInfo) {
+    if !fat32::is_mounted() {
+        return;
+    }
+    use core::fmt::Write;
+    let mut cfg = alloc::string::String::with_capacity(180);
+    let _ = writeln!(
+        cfg,
+        "ADDR={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+        dev.bd_addr[0],
+        dev.bd_addr[1],
+        dev.bd_addr[2],
+        dev.bd_addr[3],
+        dev.bd_addr[4],
+        dev.bd_addr[5]
+    );
+    if dev.has_alt_bd {
+        let _ = writeln!(
+            cfg,
+            "ALT={:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}",
+            dev.alt_bd_addr[0],
+            dev.alt_bd_addr[1],
+            dev.alt_bd_addr[2],
+            dev.alt_bd_addr[3],
+            dev.alt_bd_addr[4],
+            dev.alt_bd_addr[5]
+        );
+    }
+    let _ = writeln!(cfg, "NAME={}", dev.name_str());
+    let _ = writeln!(cfg, "AUDIO={}", if dev.is_audio { 1 } else { 0 });
+    if dev.has_link_key {
+        let _ = write!(cfg, "KEY=");
+        for b in dev.link_key.iter() {
+            let _ = write!(cfg, "{:02X}", b);
+        }
+        let _ = writeln!(cfg);
+    }
+    let ok = fat32::write_or_create_small_file("/BT.CFG", cfg.as_bytes());
+    crate::println!(
+        "[BT] Saved paired speaker '{}' ({:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}, key={}) to /BT.CFG (ok={})",
+        dev.name_str(),
+        dev.bd_addr[0],
+        dev.bd_addr[1],
+        dev.bd_addr[2],
+        dev.bd_addr[3],
+        dev.bd_addr[4],
+        dev.bd_addr[5],
+        dev.has_link_key,
+        ok
+    );
+}
+
+/// Load a previously paired Bluetooth speaker profile from `/BT.CFG` into `devices[0]`.
+pub fn load_paired_device_cfg() -> bool {
+    if !fat32::is_mounted() {
+        return false;
+    }
+    let bytes = match fat32::read_file("/BT.CFG") {
+        Some(b) if b.len() >= 17 => b,
+        _ => return false,
+    };
+    let text = match core::str::from_utf8(&bytes) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+
+    let mut dev = BtDeviceInfo::empty();
+    dev.valid = true;
+    dev.is_audio = true;
+    dev.is_ble = false;
+    dev.cod = 0x240414; // Audio/Video Loudspeaker
+    dev.rssi = -52;
+    dev.page_scan_rep = 1;
+    dev.set_name_bytes(b"SRS-XB100", true);
+
+    let mut has_addr = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(v) = line.strip_prefix("ADDR=") {
+            if let Some(mac) = parse_mac_colon(v) {
+                dev.bd_addr = mac;
+                has_addr = true;
+            }
+        } else if let Some(v) = line.strip_prefix("ALT=") {
+            if let Some(mac) = parse_mac_colon(v) {
+                dev.alt_bd_addr = mac;
+                dev.has_alt_bd = true;
+            }
+        } else if let Some(v) = line.strip_prefix("NAME=") {
+            dev.set_name_bytes(v.trim().as_bytes(), true);
+        } else if let Some(v) = line.strip_prefix("AUDIO=") {
+            dev.is_audio = v.trim() != "0";
+        } else if let Some(v) = line.strip_prefix("KEY=") {
+            if let Some(lk) = parse_hex_16(v) {
+                dev.link_key = lk;
+                dev.has_link_key = true;
+            }
+        }
+    }
+
+    if !has_addr {
+        return false;
+    }
+
+    STATE.with(|s| {
+        if s.device_count == 0 {
+            s.devices[0] = dev;
+            s.device_count = 1;
+        } else {
+            s.devices[0] = dev;
+        }
+    });
+    crate::println!(
+        "[BT] Loaded saved speaker '{}' ({:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}, key={}) from /BT.CFG",
+        dev.name_str(),
+        dev.bd_addr[0],
+        dev.bd_addr[1],
+        dev.bd_addr[2],
+        dev.bd_addr[3],
+        dev.bd_addr[4],
+        dev.bd_addr[5],
+        dev.has_link_key
+    );
+    true
+}
+
+/// Automatically page and connect the saved Bluetooth speaker (`devices[0]` from `/BT.CFG`)
+/// without running an 8-second `HCI_Inquiry` scan.
+pub fn auto_connect_saved() -> bool {
+    if BT_CMD_ACTIVE.load(Ordering::Relaxed) {
+        return false;
+    }
+    let (already_conn, has_dev, dev_name, bd) = STATE.with(|s| {
+        (
+            s.connected_index.is_some(),
+            s.device_count > 0 && s.devices[0].valid,
+            s.devices[0],
+            s.devices[0].bd_addr,
+        )
+    });
+    if already_conn {
+        return true;
+    }
+    if !has_dev && !load_paired_device_cfg() {
+        return false;
+    }
+    crate::println!(
+        "[BT] Auto-connecting saved speaker '{}' ({:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X})...",
+        dev_name.name_str(),
+        bd[0],
+        bd[1],
+        bd[2],
+        bd[3],
+        bd[4],
+        bd[5]
+    );
+    let ok = connect_device(0);
+    let st = status();
+    crate::println!(
+        "[BT] Auto-connect result: ok={}, a2dp_ready={}, media_dcid=0x{:04X}, err=0x{:02X}",
+        ok,
+        st.a2dp_ready,
+        st.avdtp_media_dcid,
+        st.last_conn_err
+    );
+    ok
 }
 
 // ─── M10.2 / M11.1: Real-Time Bluetooth A2DP 8-Subband SBC Audio Encoder & Media Streamer ───
@@ -3909,6 +4113,8 @@ unsafe fn init_bt_hw() -> bool {
         s.ble_advertising = ble_ok;
         s.classic_discoverable = classic_ok;
     });
+
+    let _ = load_paired_device_cfg();
 
     true
 }

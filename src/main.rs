@@ -108,10 +108,10 @@ pub extern "C" fn kernel_main() -> ! {
             kernel::klog::init();
             let entries = fat32::list_root();
             println!("[OK] FAT32 root directory ({} files):", entries.len());
-            for entry in entries.iter().take(5) {
+            for entry in entries.iter().take(6) {
                 println!(
-                    "     - {:<14} {:>7} bytes (cluster {})",
-                    entry.name, entry.size, entry.first_cluster
+                    "     - {:<24} {:>7} bytes (cluster {})",
+                    entry.display_name, entry.size, entry.first_cluster
                 );
             }
             if let Some(ver_bytes) = fat32::read_file("VERSION.TXT") {
@@ -124,6 +124,8 @@ pub extern "C" fn kernel_main() -> ! {
     }
     drivers::bluetooth::init();
     if !bsp::is_qemu() {
+        tryboot::watchdog_feed(15);
+        let _ = drivers::bluetooth::auto_connect_saved();
         tryboot::watchdog_feed(15);
     }
     net::init();
@@ -180,7 +182,15 @@ fn heartbeat_task() {
         console::update_status_bar(seconds, active, slot_str);
 
         let (last_irq_us, max_irq_us) = kernel::klog::irq_stats_us();
-        let bt = drivers::bluetooth::status();
+        let mut bt = drivers::bluetooth::status();
+        if bt.connected_index.is_none()
+            && bt.device_count > 0
+            && (seconds == 10 || seconds == 25)
+        {
+            if drivers::bluetooth::auto_connect_saved() {
+                bt = drivers::bluetooth::status();
+            }
+        }
         println!(
             "[TICK] {}s up (tasks={}, irq={}/{}us, bt_conn={:?}, a2dp_pkts={})",
             seconds, active, last_irq_us, max_irq_us, bt.connected_index, bt.a2dp_packets_sent

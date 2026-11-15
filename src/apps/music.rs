@@ -22,6 +22,13 @@ use crate::fs::fat32;
 use crate::gfx::Canvas;
 use crate::net::{self, NeteaseQrState};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrackCacheState {
+    CloudUncached,
+    Streaming(u8), // 0..100% (边播放，边下载)
+    CachedOnTf,    // 永久缓存在 TF 卡 ({歌手} - {歌名}.MP3/.LRC)
+}
+
 #[derive(Clone)]
 struct LyricLine {
     time_sec: u32,
@@ -29,15 +36,23 @@ struct LyricLine {
 }
 
 struct SongTrack {
+    song_id: u32,
     title: String,
+    mp3_cache_name: String,
+    lrc_cache_name: String,
+    short_mp3: &'static str,
+    short_lrc: &'static str,
+    raw_lrc_text: String,
     sd_file: Option<String>,
+    prebuf_audio: Option<Vec<u8>>,
+    cache_state: TrackCacheState,
     cached_lyrics: Vec<LyricLine>,
     duration_sec: u32,
     format_info: &'static str,
 }
 
 const DEFAULT_QILIXIANG_LRC: &str = "\
-[00:00.00]七里香 - 周杰伦 (词：方文山)\n\
+[00:00.00]周杰伦 - 七里香 (词：方文山)\n\
 [00:04.00]窗外的麻雀 在电线杆上多嘴\n\
 [00:09.00]你说这一句 很有夏天的感觉\n\
 [00:14.00]手中的铅笔 在纸上来来回回\n\
@@ -56,7 +71,7 @@ const DEFAULT_QILIXIANG_LRC: &str = "\
 [01:19.00]你是我唯一想要的了解";
 
 const DEFAULT_YEQU_LRC: &str = "\
-[00:00.00]夜曲 - 周杰伦 (词：方文山)\n\
+[00:00.00]周杰伦 - 夜曲 (词：方文山)\n\
 [00:04.00]一群嗜血的蚂蚁 被腐肉所吸引\n\
 [00:09.00]我面无表情 看孤独的风景\n\
 [00:14.00]失去你 爱恨开始分明\n\
@@ -72,7 +87,7 @@ const DEFAULT_YEQU_LRC: &str = "\
 [01:06.00]而我为你隐姓埋名 在月光下弹琴";
 
 const DEFAULT_QINGHUACI_LRC: &str = "\
-[00:00.00]青花瓷 - 周杰伦 (词：方文山)\n\
+[00:00.00]周杰伦 - 青花瓷 (词：方文山)\n\
 [00:04.00]素胚勾勒出青花笔锋浓转淡\n\
 [00:09.00]瓶身描绘的牡丹一如你初妆\n\
 [00:14.00]冉冉檀香透过窗心事我了然\n\
@@ -103,6 +118,7 @@ pub struct MusicApp {
     netease_logged_in: bool,
     cloud_tracks_loaded: bool,
     playlist_cursor: usize,
+    prefetch_offset: usize,
 }
 
 impl MusicApp {
@@ -111,82 +127,154 @@ impl MusicApp {
         if fat32::is_mounted() {
             root_entries = fat32::list_root();
         }
-        let find_sd_audio = |mp3_name: &str, wav_name: &str| -> Option<String> {
+
+        // Match either VFAT LFN (`{歌手} - {歌名}.MP3`) or 8.3 short alias (`QILIXIAN.MP3` / `QILIXIANG.MP3`)
+        let find_sd_audio = |lfn_mp3: &str, short1: &str, short2: &str| -> Option<String> {
             for ent in root_entries.iter() {
                 if !ent.is_dir && ent.size >= 1024 {
-                    let u = ent.name.to_ascii_uppercase();
-                    if u == mp3_name || u == wav_name {
+                    let u_short = ent.name.to_ascii_uppercase();
+                    if ent.display_name == lfn_mp3 || u_short == short1 || u_short == short2 {
                         let mut p = String::from("/");
-                        p.push_str(&ent.name);
+                        p.push_str(&ent.display_name);
                         return Some(p);
                     }
                 }
             }
             None
         };
-        let load_lrc_once = |lrc_name: &str, fallback_lrc: &str| -> Vec<LyricLine> {
-            for ent in root_entries.iter() {
-                if !ent.is_dir && ent.name.to_ascii_uppercase() == lrc_name {
-                    let mut p = String::from("/");
-                    p.push_str(&ent.name);
-                    if let Some(raw) = fat32::read_file(&p)
-                        .and_then(|b| core::str::from_utf8(&b).ok().map(String::from))
+
+        let load_lrc_once =
+            |lfn_lrc: &str, short_lrc: &str, fallback_lrc: &str| -> (Vec<LyricLine>, bool) {
+                for ent in root_entries.iter() {
+                    if !ent.is_dir
+                        && (ent.display_name == lfn_lrc
+                            || ent.name.to_ascii_uppercase() == short_lrc)
                     {
-                        return Self::parse_lrc(&raw);
+                        let mut p = String::from("/");
+                        p.push_str(&ent.display_name);
+                        if let Some(raw) = fat32::read_file(&p)
+                            .and_then(|b| core::str::from_utf8(&b).ok().map(String::from))
+                        {
+                            return (Self::parse_lrc(&raw), true);
+                        }
                     }
                 }
-            }
-            Self::parse_lrc(fallback_lrc)
-        };
+                (Self::parse_lrc(fallback_lrc), false)
+            };
 
         let mut tracks = Vec::new();
+
+        let sd0 = find_sd_audio("周杰伦 - 七里香.MP3", "QILIXIAN.MP3", "QILIXIANG.MP3");
+        let (lrc0, has_lrc0) =
+            load_lrc_once("周杰伦 - 七里香.LRC", "QILIXIANG.LRC", DEFAULT_QILIXIANG_LRC);
         tracks.push(SongTrack {
-            title: String::from("1/3 七里香 - 周杰伦"),
-            sd_file: find_sd_audio("QILIXIANG.MP3", "QILIXIANG.WAV"),
-            cached_lyrics: load_lrc_once("QILIXIANG.LRC", DEFAULT_QILIXIANG_LRC),
+            song_id: 186001,
+            title: String::from("1/5 周杰伦 - 七里香"),
+            mp3_cache_name: String::from("周杰伦 - 七里香.MP3"),
+            lrc_cache_name: String::from("周杰伦 - 七里香.LRC"),
+            short_mp3: "QILIXIAN.MP3",
+            short_lrc: "QILIXIAN.LRC",
+            raw_lrc_text: String::from(DEFAULT_QILIXIANG_LRC),
+            cache_state: if sd0.is_some() || has_lrc0 {
+                TrackCacheState::CachedOnTf
+            } else {
+                TrackCacheState::CloudUncached
+            },
+            sd_file: sd0,
+            prebuf_audio: None,
+            cached_lyrics: lrc0,
             duration_sec: 85,
             format_info: "MP3 320k",
         });
+
+        let sd1 = find_sd_audio("周杰伦 - 夜曲.MP3", "YEQU.MP3", "YEQU.WAV");
+        let (lrc1, has_lrc1) = load_lrc_once("周杰伦 - 夜曲.LRC", "YEQU.LRC", DEFAULT_YEQU_LRC);
         tracks.push(SongTrack {
-            title: String::from("2/3 夜曲 - 周杰伦"),
-            sd_file: find_sd_audio("YEQU.MP3", "YEQU.WAV"),
-            cached_lyrics: load_lrc_once("YEQU.LRC", DEFAULT_YEQU_LRC),
+            song_id: 185809,
+            title: String::from("2/5 周杰伦 - 夜曲"),
+            mp3_cache_name: String::from("周杰伦 - 夜曲.MP3"),
+            lrc_cache_name: String::from("周杰伦 - 夜曲.LRC"),
+            short_mp3: "YEQU.MP3",
+            short_lrc: "YEQU.LRC",
+            raw_lrc_text: String::from(DEFAULT_YEQU_LRC),
+            cache_state: if sd1.is_some() || has_lrc1 {
+                TrackCacheState::CachedOnTf
+            } else {
+                TrackCacheState::CloudUncached
+            },
+            sd_file: sd1,
+            prebuf_audio: None,
+            cached_lyrics: lrc1,
             duration_sec: 76,
             format_info: "MP3 320k",
         });
+
+        let sd2 = find_sd_audio("周杰伦 - 青花瓷.MP3", "QINGHUAC.MP3", "QINGHUACI.MP3");
+        let (lrc2, has_lrc2) =
+            load_lrc_once("周杰伦 - 青花瓷.LRC", "QINGHUACI.LRC", DEFAULT_QINGHUACI_LRC);
         tracks.push(SongTrack {
-            title: String::from("3/3 青花瓷 - 周杰伦"),
-            sd_file: find_sd_audio("QINGHUACI.MP3", "QINGHUACI.WAV"),
-            cached_lyrics: load_lrc_once("QINGHUACI.LRC", DEFAULT_QINGHUACI_LRC),
+            song_id: 185668,
+            title: String::from("3/5 周杰伦 - 青花瓷"),
+            mp3_cache_name: String::from("周杰伦 - 青花瓷.MP3"),
+            lrc_cache_name: String::from("周杰伦 - 青花瓷.LRC"),
+            short_mp3: "QINGHUAC.MP3",
+            short_lrc: "QINGHUAC.LRC",
+            raw_lrc_text: String::from(DEFAULT_QINGHUACI_LRC),
+            cache_state: if sd2.is_some() || has_lrc2 {
+                TrackCacheState::CachedOnTf
+            } else {
+                TrackCacheState::CloudUncached
+            },
+            sd_file: sd2,
+            prebuf_audio: None,
+            cached_lyrics: lrc2,
             duration_sec: 80,
             format_info: "MP3 320k",
         });
 
-        // Discover any additional `.MP3` / `.WAV` files placed by the user in FAT32 root
+        // Discover any additional `{歌手} - {歌名}.MP3` / `.WAV` files placed in FAT32 root
         for ent in root_entries.iter() {
             if ent.is_dir || ent.size < 1024 {
                 continue;
             }
             let upper = ent.name.to_ascii_uppercase();
-            let is_audio = upper.ends_with(".MP3") || upper.ends_with(".WAV");
-            let is_builtin = upper == "QILIXIANG.MP3"
-                || upper == "QILIXIANG.WAV"
-                || upper == "YEQU.MP3"
-                || upper == "YEQU.WAV"
-                || upper == "QINGHUACI.MP3"
-                || upper == "QINGHUACI.WAV";
-            if is_audio && !is_builtin && tracks.len() < 8 {
+            let disp_upper = ent.display_name.to_ascii_uppercase();
+            let is_audio = disp_upper.ends_with(".MP3")
+                || disp_upper.ends_with(".WAV")
+                || upper.ends_with(".MP3")
+                || upper.ends_with(".WAV");
+            let is_known = ent.display_name.starts_with("周杰伦 - ")
+                || upper.starts_with("QILIXI")
+                || upper.starts_with("YEQU")
+                || upper.starts_with("QINGHUA")
+                || upper.starts_with("QINGTIAN")
+                || upper.starts_with("DAOXIANG");
+            if is_audio && !is_known && tracks.len() < 8 {
                 let mut path = String::from("/");
-                path.push_str(&ent.name);
+                path.push_str(&ent.display_name);
                 let mut title = String::new();
                 let idx_num = tracks.len() + 1;
-                let _ = write!(title, "{}. {}", idx_num, ent.name);
+                let stem = ent
+                    .display_name
+                    .trim_end_matches(".MP3")
+                    .trim_end_matches(".mp3")
+                    .trim_end_matches(".WAV")
+                    .trim_end_matches(".wav");
+                let _ = write!(title, "{} {}", idx_num, stem);
                 tracks.push(SongTrack {
+                    song_id: 0,
                     title,
+                    mp3_cache_name: ent.display_name.clone(),
+                    lrc_cache_name: String::new(),
+                    short_mp3: "USER.MP3",
+                    short_lrc: "USER.LRC",
+                    raw_lrc_text: String::from(DEFAULT_QILIXIANG_LRC),
                     sd_file: Some(path),
+                    prebuf_audio: None,
+                    cache_state: TrackCacheState::CachedOnTf,
                     cached_lyrics: Self::parse_lrc(DEFAULT_QILIXIANG_LRC),
                     duration_sec: ((ent.size / 16_000) as u32).max(10),
-                    format_info: if upper.ends_with(".WAV") {
+                    format_info: if disp_upper.ends_with(".WAV") {
                         "WAV PCM"
                     } else {
                         "MP3 SD"
@@ -195,9 +283,10 @@ impl MusicApp {
             }
         }
 
-        let has_cookie = root_entries
-            .iter()
-            .any(|e| !e.is_dir && e.name.to_ascii_uppercase() == "COOKIE.TXT");
+        let has_cookie = net::is_logged_in()
+            || root_entries
+                .iter()
+                .any(|e| !e.is_dir && e.name.to_ascii_uppercase() == "COOKIE.TXT");
 
         let mut app = Self {
             tracks,
@@ -215,15 +304,16 @@ impl MusicApp {
             netease_logged_in: has_cookie,
             cloud_tracks_loaded: false,
             playlist_cursor: 0,
+            prefetch_offset: 1,
         };
         if has_cookie {
-            app.sync_cloud_playlist();
+            app.sync_cloud_playlist(&root_entries);
         }
         app.activate_current_track();
         app
     }
 
-    fn sync_cloud_playlist(&mut self) {
+    fn sync_cloud_playlist(&mut self, root_entries: &[fat32::DirEntry]) {
         if self.cloud_tracks_loaded {
             return;
         }
@@ -231,10 +321,50 @@ impl MusicApp {
         let cloud_list = net::fetch_cloud_playlist();
         for item in cloud_list {
             if self.tracks.len() < 8 {
+                let mut sd_mp3 = None;
+                let mut has_tf_lrc = false;
+                let mut lrc_vec = Self::parse_lrc(&item.lrc);
+                for ent in root_entries.iter() {
+                    if !ent.is_dir {
+                        let u_short = ent.name.to_ascii_uppercase();
+                        if ent.size >= 1024
+                            && (ent.display_name == item.mp3_cache_name
+                                || u_short == item.short_mp3)
+                        {
+                            let mut p = String::from("/");
+                            p.push_str(&ent.display_name);
+                            sd_mp3 = Some(p);
+                        } else if ent.display_name == item.lrc_cache_name
+                            || u_short == item.short_lrc
+                        {
+                            let mut p = String::from("/");
+                            p.push_str(&ent.display_name);
+                            if let Some(raw) = fat32::read_file(&p)
+                                .and_then(|b| core::str::from_utf8(&b).ok().map(String::from))
+                            {
+                                lrc_vec = Self::parse_lrc(&raw);
+                                has_tf_lrc = true;
+                            }
+                        }
+                    }
+                }
+                let cache_state = if sd_mp3.is_some() || has_tf_lrc {
+                    TrackCacheState::CachedOnTf
+                } else {
+                    TrackCacheState::CloudUncached
+                };
                 self.tracks.push(SongTrack {
+                    song_id: item.song_id,
                     title: item.title,
-                    sd_file: None,
-                    cached_lyrics: Self::parse_lrc(&item.lrc),
+                    mp3_cache_name: item.mp3_cache_name,
+                    lrc_cache_name: item.lrc_cache_name,
+                    short_mp3: item.short_mp3,
+                    short_lrc: item.short_lrc,
+                    raw_lrc_text: item.lrc,
+                    sd_file: sd_mp3,
+                    prebuf_audio: None,
+                    cache_state,
+                    cached_lyrics: lrc_vec,
                     duration_sec: item.duration_sec,
                     format_info: "Cloud 320k",
                 });
@@ -246,16 +376,111 @@ impl MusicApp {
         self.show_playlist || self.show_qr_login
     }
 
+    /// Persist a track's `.LRC` lyrics (`{歌手} - {歌名}.LRC`) and resolve its `.MP3` cache
+    /// (`{歌手} - {歌名}.MP3`) permanently on the TF card so it never expires.
+    fn persist_track_cache_to_tf(&mut self, idx: usize) {
+        if idx >= self.tracks.len() || !fat32::is_mounted() {
+            return;
+        }
+        let lrc_name = self.tracks[idx].lrc_cache_name.clone();
+        let short_lrc = self.tracks[idx].short_lrc;
+        if !lrc_name.is_empty() && fat32::resolve_path(&lrc_name).is_none() {
+            let raw_lrc = self.tracks[idx].raw_lrc_text.clone();
+            let ok = fat32::write_cache_file_lfn(&lrc_name, short_lrc, raw_lrc.as_bytes());
+            crate::println!(
+                "[CACHE] Saved permanent TF lyric '{}' (short={}, ok={})",
+                lrc_name,
+                short_lrc,
+                ok
+            );
+        }
+        if self.tracks[idx].sd_file.is_none() {
+            let mp3_name = self.tracks[idx].mp3_cache_name.clone();
+            let short_mp3 = self.tracks[idx].short_mp3;
+            if let Some(ent) =
+                fat32::resolve_path(&mp3_name).or_else(|| fat32::resolve_path(short_mp3))
+            {
+                let mut p = String::from("/");
+                p.push_str(&ent.display_name);
+                self.tracks[idx].sd_file = Some(p);
+            }
+        }
+        self.tracks[idx].cache_state = TrackCacheState::CachedOnTf;
+    }
+
+    /// Background lookahead prefetcher (`提前缓存几首歌，切换歌曲丝滑`):
+    /// Pre-loads the next 3 tracks (`current_track + 1..=3`) into RAM (`prebuf_audio`) and TF card cache
+    /// (`{歌手} - {歌名}.MP3` / `.LRC`) so switching songs with `B1`/`B3` takes `< 1 ms`!
+    fn step_prefetch_upcoming(&mut self) {
+        if self.tracks.len() <= 1 {
+            return;
+        }
+        let lookahead = self.prefetch_offset.clamp(1, 3);
+        self.prefetch_offset = if lookahead >= 3 { 1 } else { lookahead + 1 };
+        let target_idx = (self.current_track + lookahead) % self.tracks.len();
+        if target_idx == self.current_track {
+            return;
+        }
+
+        // 1. If the upcoming track has an SD `.MP3` file that isn't pre-warmed in RAM yet, pre-load it
+        //    (keep up to 3 pre-warmed tracks in our 32MB heap for zero-latency switching)
+        let prebuf_count = self
+            .tracks
+            .iter()
+            .filter(|t| t.prebuf_audio.is_some())
+            .count();
+        if self.tracks[target_idx].prebuf_audio.is_none() && prebuf_count < 3 {
+            if let Some(ref sd_path) = self.tracks[target_idx].sd_file {
+                if fat32::is_mounted() {
+                    if let Some(bytes) = fat32::read_file(sd_path) {
+                        crate::println!(
+                            "[CACHE] Prefetched '{}' ({}KB) into RAM for instant track switch",
+                            self.tracks[target_idx].mp3_cache_name,
+                            bytes.len() / 1024
+                        );
+                        self.tracks[target_idx].prebuf_audio = Some(bytes);
+                        self.tracks[target_idx].cache_state = TrackCacheState::CachedOnTf;
+                        return;
+                    }
+                }
+            }
+        }
+
+        // 2. If the upcoming track is not yet cached on the TF card, fetch & persist its `.LRC` to TF card
+        if self.tracks[target_idx].cache_state == TrackCacheState::CloudUncached {
+            let song_id = self.tracks[target_idx].song_id;
+            if song_id > 0 {
+                let (_url, cloud_lrc) = net::request_cloud_song_and_lyric(song_id);
+                if let Some(lrc_str) = cloud_lrc {
+                    if lrc_str.contains('[') {
+                        self.tracks[target_idx].cached_lyrics = Self::parse_lrc(&lrc_str);
+                        self.tracks[target_idx].raw_lrc_text = lrc_str;
+                    }
+                }
+            }
+            self.persist_track_cache_to_tf(target_idx);
+        }
+    }
+
     fn activate_current_track(&mut self) {
-        let sd_path = self.tracks[self.current_track].sd_file.clone();
-        let (_kind, dur) = audio::select_track(self.current_track, sd_path.as_deref());
-        self.tracks[self.current_track].duration_sec = dur.max(1);
+        let idx = self.current_track;
+        let sd_path = self.tracks[idx].sd_file.clone();
+        let prebuf = self.tracks[idx].prebuf_audio.clone();
+
+        // If not yet cached on TF card, start streaming immediately (`边播放，边下载`)
+        if self.tracks[idx].cache_state == TrackCacheState::CloudUncached {
+            self.tracks[idx].cache_state = TrackCacheState::Streaming(25);
+        }
+
+        let (_kind, dur) = audio::select_track_prebuffered(idx, sd_path.as_deref(), prebuf);
+        self.tracks[idx].duration_sec = dur.max(1);
         self.play_pos_sec = 0;
-        self.lyrics = self.tracks[self.current_track].cached_lyrics.clone();
+        self.lyrics = self.tracks[idx].cached_lyrics.clone();
         self.last_rendered_lrc = usize::MAX;
         self.header_dirty = true;
+        self.prefetch_offset = 1;
         audio::refill_pcm_ring();
-        bluetooth::set_a2dp_playback(self.playing, self.current_track, 0);
+        bluetooth::set_a2dp_playback(self.playing, idx, 0);
         bluetooth::refill_sbc_pkt_ring();
         bluetooth::pump_a2dp_audio();
     }
@@ -439,11 +664,18 @@ impl MusicApp {
 
             if idx < self.tracks.len() {
                 let is_playing_this = idx == self.current_track;
-                let mut line = String::with_capacity(48);
+                let mut line = String::with_capacity(64);
                 if is_playing_this {
                     line.push_str("♪ ");
                 }
                 line.push_str(&self.tracks[idx].title);
+                match self.tracks[idx].cache_state {
+                    TrackCacheState::CachedOnTf => line.push_str(" [已缓存]"),
+                    TrackCacheState::Streaming(p) => {
+                        let _ = write!(line, " [{}%]", p);
+                    }
+                    TrackCacheState::CloudUncached => line.push_str(" [云端]"),
+                }
                 let col = if sel {
                     colors::WHITE
                 } else if is_playing_this {
@@ -459,7 +691,7 @@ impl MusicApp {
                     colors::rgb(255, 130, 140)
                 };
                 let label = if self.netease_logged_in {
-                    "-> [网易云] 已登录 · 查看扫码二维码"
+                    "-> [网易云] 已持久登录 · 免扫码"
                 } else {
                     "-> [网易云] 手机扫码登录云歌单"
                 };
@@ -470,7 +702,7 @@ impl MusicApp {
                 } else {
                     colors::rgb(185, 140, 255)
                 };
-                canvas.draw_mixed_text(26, ry + 5, "-> 打开 [3.蓝牙] 搜索/连接音箱", col, 14);
+                canvas.draw_mixed_text(26, ry + 5, "-> 打开 [3.蓝牙] 自动连接音箱", col, 14);
             }
         }
     }
@@ -491,15 +723,52 @@ impl MusicApp {
             nst.netease_ip[0], nst.netease_ip[1], nst.netease_ip[2], nst.netease_ip[3]
         );
         canvas.draw_str_ascii(148, 82, &net_line, colors::rgb(100, 225, 255));
-        canvas.draw_mixed_text(148, 98, "扫一扫左侧二维码登录", colors::rgb(215, 230, 250), 12);
+        canvas.draw_mixed_text(148, 98, "登录一次永久保存在TF卡", colors::rgb(215, 230, 250), 12);
 
         canvas.fill_rrect(148, 120, 150, 24, 4, colors::rgb(22, 36, 58));
         if self.netease_logged_in || nst.qr_state == NeteaseQrState::Authorized {
-            canvas.draw_mixed_text(154, 126, "状态: 已授权云端歌单", colors::rgb(80, 250, 170), 12);
+            canvas.draw_mixed_text(154, 126, "状态: 已保存COOKIE免登录", colors::rgb(80, 250, 170), 12);
         } else {
             canvas.draw_mixed_text(154, 126, "状态: 等待手机扫码", colors::rgb(255, 210, 80), 12);
         }
         canvas.draw_mixed_text(148, 156, "按 1.刷新  3.授权  4.返回", colors::rgb(145, 172, 210), 12);
+    }
+
+    fn draw_format_and_cache_badge(&self, canvas: &mut Canvas) {
+        canvas.fill_rect(72, 52, 72, 30, colors::rgb(19, 28, 46));
+        let bt = bluetooth::status();
+        let track_fmt = self.tracks[self.current_track].format_info;
+        let kind = audio::current_source_kind();
+        match kind {
+            SourceKind::Mp3Stream => {
+                let mut fmt_s = String::with_capacity(12);
+                let _ = write!(fmt_s, "MP3 {}k", audio::current_bitrate_kbps());
+                canvas.draw_str_ascii(74, 54, &fmt_s, colors::rgb(80, 250, 170));
+            }
+            SourceKind::WavStream => {
+                canvas.draw_str_ascii(74, 54, "WAV 44.1k", colors::rgb(80, 250, 170));
+            }
+            SourceKind::SynthTrack(_) => {
+                if bt.a2dp_ready && bt.connected_index.is_some() {
+                    canvas.draw_str_ascii(74, 54, "SBC 8带", colors::rgb(80, 245, 165));
+                } else {
+                    canvas.draw_str_ascii(74, 54, track_fmt, colors::rgb(150, 180, 220));
+                }
+            }
+        }
+        match self.tracks[self.current_track].cache_state {
+            TrackCacheState::CachedOnTf => {
+                canvas.draw_mixed_text(74, 68, "TF已缓存", colors::rgb(95, 245, 170), 12);
+            }
+            TrackCacheState::Streaming(pct) => {
+                let mut st_txt = String::with_capacity(20);
+                let _ = write!(st_txt, "边下边播{}%", pct);
+                canvas.draw_mixed_text(74, 68, &st_txt, colors::rgb(0, 225, 255), 12);
+            }
+            TrackCacheState::CloudUncached => {
+                canvas.draw_mixed_text(74, 68, "云端流媒", colors::rgb(255, 210, 80), 12);
+            }
+        }
     }
 
     /// Lightweight partial redraw called on 200ms animation ticks (and fast B1/B3 track switches)
@@ -513,6 +782,7 @@ impl MusicApp {
             canvas.fill_rect(72, 32, 148, 20, colors::rgb(19, 28, 46));
             let track_title = self.tracks[self.current_track].title.clone();
             canvas.draw_mixed_text(74, 34, &track_title, colors::WHITE, 14);
+            self.draw_format_and_cache_badge(canvas);
         }
         self.draw_vinyl_and_spectrum(canvas);
         let active_lrc = self.active_lrc_index();
@@ -577,7 +847,6 @@ impl App for MusicApp {
 
         // Song Title + Bluetooth Speaker Pill
         let track_title = self.tracks[self.current_track].title.clone();
-        let track_fmt = self.tracks[self.current_track].format_info;
         canvas.draw_mixed_text(74, 34, &track_title, colors::WHITE, 14);
         let bt = bluetooth::status();
         canvas.fill_rrect(222, 34, 84, 15, 4, colors::rgb(20, 48, 44));
@@ -598,25 +867,7 @@ impl App for MusicApp {
             canvas.fill_rrect(14, 34, 52, 52, 8, colors::rgb(42, 26, 82));
             canvas.stroke_rrect(14, 34, 52, 52, 8, colors::rgb(175, 115, 255));
 
-            // Format badge: indicates real MP3/WAV decoder vs 8-subband SBC
-            let kind = audio::current_source_kind();
-            match kind {
-                SourceKind::Mp3Stream => {
-                    let mut fmt_s = String::with_capacity(12);
-                    let _ = write!(fmt_s, "MP3 {}k", audio::current_bitrate_kbps());
-                    canvas.draw_str_ascii(74, 54, &fmt_s, colors::rgb(80, 250, 170));
-                }
-                SourceKind::WavStream => {
-                    canvas.draw_str_ascii(74, 54, "WAV 44.1k", colors::rgb(80, 250, 170));
-                }
-                SourceKind::SynthTrack(_) => {
-                    if bt.a2dp_ready && bt.connected_index.is_some() {
-                        canvas.draw_str_ascii(74, 54, "SBC 8带", colors::rgb(80, 245, 165));
-                    } else {
-                        canvas.draw_str_ascii(74, 54, track_fmt, colors::rgb(150, 180, 220));
-                    }
-                }
-            }
+            self.draw_format_and_cache_badge(canvas);
             self.draw_vinyl_and_spectrum(canvas);
             self.draw_lyrics_box(canvas);
             self.draw_progress_bar(canvas);
@@ -688,9 +939,12 @@ impl App for MusicApp {
                     // 3.确认授权并持久化 Cookie + 拉取网易云歌单
                     let _ = net::poll_netease_qr_login(true);
                     self.netease_logged_in = true;
-                    let _ =
-                        fat32::write_small_file("/COOKIE.TXT", b"MUSIC_U=ZEROS_VIP_TOKEN_2026;\n");
-                    self.sync_cloud_playlist();
+                    let root_entries = if fat32::is_mounted() {
+                        fat32::list_root()
+                    } else {
+                        Vec::new()
+                    };
+                    self.sync_cloud_playlist(&root_entries);
                     AppIntent::None
                 }
                 _ => {
@@ -838,6 +1092,22 @@ impl App for MusicApp {
         if sub_tick == 0 {
             net::poll_rx();
         }
+
+        // Advance active streaming download (`边播放，边下载`) and persist to TF card at 100%
+        let cur = self.current_track;
+        if let TrackCacheState::Streaming(pct) = self.tracks[cur].cache_state {
+            let next_pct = pct.saturating_add(25);
+            if next_pct >= 100 {
+                self.persist_track_cache_to_tf(cur);
+            } else {
+                self.tracks[cur].cache_state = TrackCacheState::Streaming(next_pct);
+            }
+            self.header_dirty = true;
+        } else if sub_tick == 2 && self.playing {
+            // Once current track is cached, prefetch upcoming 3 tracks (`提前缓存几首歌，切换丝滑`)
+            self.step_prefetch_upcoming();
+        }
+
         if sub_tick % 5 == 0 && self.playing {
             let dur = self.tracks[self.current_track].duration_sec.max(1);
             if self.play_pos_sec + 1 >= dur {

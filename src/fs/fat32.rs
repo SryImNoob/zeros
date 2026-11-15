@@ -613,6 +613,280 @@ pub fn write_small_file(filename: &str, new_data: &[u8]) -> bool {
     }
 }
 
+/// Update an existing small file (`<= 512` bytes) or create a new 8.3 root directory file if missing.
+/// Used to persist `/BT.CFG` (Bluetooth auto-connect profile) and `/COOKIE.TXT` (NetEase session).
+pub fn write_or_create_small_file(filename: &str, new_data: &[u8]) -> bool {
+    if new_data.len() > SECTOR_SIZE {
+        return false;
+    }
+    if let Some(mut entry) = resolve_path(filename) {
+        if entry.first_cluster >= 2 {
+            return write_entry_small(&mut entry, new_data);
+        }
+    }
+    let short_name = filename.trim_matches('/');
+    write_cache_file_lfn(short_name, short_name, new_data)
+}
+
+/// Format an ASCII `"NAME.EXT"` string into an 11-byte padded 8.3 directory name (`[u8; 11]`).
+fn format_8_3_raw(short_name: &str) -> [u8; 11] {
+    let mut raw = [b' '; 11];
+    let trimmed = short_name.trim_matches('/');
+    let (base, ext) = match trimmed.rfind('.') {
+        Some(dot) => (&trimmed[..dot], &trimmed[dot + 1..]),
+        None => (trimmed, ""),
+    };
+    for (i, b) in base.bytes().take(8).enumerate() {
+        raw[i] = if b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'~' {
+            b.to_ascii_uppercase()
+        } else {
+            b'_'
+        };
+    }
+    for (i, b) in ext.bytes().take(3).enumerate() {
+        raw[8 + i] = if b.is_ascii_alphanumeric() {
+            b.to_ascii_uppercase()
+        } else {
+            b'_'
+        };
+    }
+    raw
+}
+
+/// Compute Microsoft VFAT Long File Name (LFN) 8-bit checksum over an 11-byte 8.3 short name.
+fn lfn_checksum(short_raw: &[u8; 11]) -> u8 {
+    let mut sum: u8 = 0;
+    for &b in short_raw.iter() {
+        sum = (sum.rotate_right(1)).wrapping_add(b);
+    }
+    sum
+}
+
+/// Allocate `count` free clusters (`>= 3`) from the FAT32 table and link them as a chain ending in `0x0FFF_FFFF`.
+fn allocate_cluster_chain(vol: &Fat32Volume, count: usize) -> Option<Vec<u32>> {
+    if count == 0 {
+        return Some(Vec::new());
+    }
+    let mut chain = Vec::with_capacity(count);
+    let mut sec_buf = [0u8; SECTOR_SIZE];
+    let max_fat_sectors = vol.sectors_per_fat.min(512);
+
+    // Search FAT1 starting at sector 0 (cluster >= 3)
+    'search: for s in 0..max_fat_sectors {
+        let fat_lba = vol.fat_start_lba + s;
+        if !sd::read_sector(fat_lba, &mut sec_buf) {
+            return None;
+        }
+        let mut dirty = false;
+        let start_idx = if s == 0 { 3usize } else { 0usize };
+        for idx in start_idx..128 {
+            let off = idx * 4;
+            let val = u32::from_le_bytes([
+                sec_buf[off],
+                sec_buf[off + 1],
+                sec_buf[off + 2],
+                sec_buf[off + 3],
+            ]) & 0x0FFF_FFFF;
+            if val == 0 {
+                let cluster_num = s * 128 + (idx as u32);
+                chain.push(cluster_num);
+                // Temporarily mark as EOC in this sector
+                sec_buf[off..off + 4].copy_from_slice(&0x0FFF_FFFFu32.to_le_bytes());
+                dirty = true;
+                if chain.len() == count {
+                    let _ = sd::write_sector(fat_lba, &sec_buf);
+                    if vol.num_fats >= 2 {
+                        let _ = sd::write_sector(fat_lba + vol.sectors_per_fat, &sec_buf);
+                    }
+                    break 'search;
+                }
+            }
+        }
+        if dirty {
+            let _ = sd::write_sector(fat_lba, &sec_buf);
+            if vol.num_fats >= 2 {
+                let _ = sd::write_sector(fat_lba + vol.sectors_per_fat, &sec_buf);
+            }
+        }
+    }
+
+    if chain.len() < count {
+        return None;
+    }
+
+    // Link cluster[i] -> cluster[i + 1], and cluster[count - 1] -> 0x0FFF_FFFF
+    for i in 0..chain.len() {
+        let cur = chain[i];
+        let next_val = if i + 1 < chain.len() {
+            chain[i + 1]
+        } else {
+            0x0FFF_FFFF
+        };
+        let fat_off = cur * 4;
+        let fat_sec = vol.fat_start_lba + (fat_off / 512);
+        let ent_off = (fat_off % 512) as usize;
+        if sd::read_sector(fat_sec, &mut sec_buf) {
+            sec_buf[ent_off..ent_off + 4].copy_from_slice(&next_val.to_le_bytes());
+            let _ = sd::write_sector(fat_sec, &sec_buf);
+            if vol.num_fats >= 2 {
+                let _ = sd::write_sector(fat_sec + vol.sectors_per_fat, &sec_buf);
+            }
+        }
+    }
+
+    Some(chain)
+}
+
+/// Write `data` across a pre-allocated cluster chain on the FAT32 data region.
+fn write_clusters_data(vol: &Fat32Volume, chain: &[u32], data: &[u8]) -> bool {
+    let spc = vol.sectors_per_cluster as usize;
+    let mut written = 0usize;
+    let mut sec_buf = [0u8; SECTOR_SIZE];
+
+    for &cluster in chain {
+        let base_lba = vol.cluster_to_lba(cluster);
+        for s in 0..spc {
+            if written >= data.len() {
+                return true;
+            }
+            let chunk = (data.len() - written).min(SECTOR_SIZE);
+            sec_buf.fill(0);
+            sec_buf[..chunk].copy_from_slice(&data[written..written + chunk]);
+            if !sd::write_sector(base_lba + (s as u32), &sec_buf) {
+                return false;
+            }
+            written += chunk;
+        }
+    }
+    true
+}
+
+/// Write or update a cached file on the TF card using a recognizable VFAT Long File Name
+/// (e.g. `display_name = "周杰伦 - 七里香.MP3"` or `"周杰伦 - 七里香.LRC"`, `short_8_3 = "QILIXIAN.MP3"`).
+pub fn write_cache_file_lfn(display_name: &str, short_8_3: &str, data: &[u8]) -> bool {
+    if data.is_empty() {
+        return false;
+    }
+    let vol = match unsafe { &*core::ptr::addr_of!(VOLUME) } {
+        Some(v) => v,
+        None => return false,
+    };
+    let disp_clean = display_name.trim_matches('/');
+    let short_clean = short_8_3.trim_matches('/');
+    let cluster_bytes = (vol.sectors_per_cluster as usize) * SECTOR_SIZE;
+    let needed_clusters = (data.len() + cluster_bytes - 1) / cluster_bytes;
+
+    // 1. If the file already exists on the TF card and has enough clusters, update in-place!
+    if let Some(existing) = resolve_path(disp_clean).or_else(|| resolve_path(short_clean)) {
+        let chain = build_cluster_chain(&existing);
+        if chain.len() >= needed_clusters && !chain.is_empty() {
+            if !write_clusters_data(vol, &chain[..needed_clusters], data) {
+                return false;
+            }
+            let mut dir_buf = [0u8; SECTOR_SIZE];
+            if !sd::read_sector(existing.dir_sector, &mut dir_buf) {
+                return false;
+            }
+            let off = existing.dir_offset + 28;
+            dir_buf[off..off + 4].copy_from_slice(&(data.len() as u32).to_le_bytes());
+            return sd::write_sector(existing.dir_sector, &dir_buf);
+        }
+    }
+
+    // 2. Allocate cluster chain and write file data sectors
+    let chain = match allocate_cluster_chain(vol, needed_clusters) {
+        Some(c) if !c.is_empty() => c,
+        _ => return false,
+    };
+    if !write_clusters_data(vol, &chain, data) {
+        return false;
+    }
+    let first_cluster = chain[0];
+
+    // 3. Build VFAT UTF-16LE Long File Name (LFN) directory entries + 8.3 short entry
+    let short_raw = format_8_3_raw(short_clean);
+    let cksum = lfn_checksum(&short_raw);
+    let mut utf16: Vec<u16> = disp_clean.encode_utf16().collect();
+    let need_lfn = !eq_ignore_ascii_case(disp_clean, short_clean);
+    let lfn_slots_count = if need_lfn {
+        ((utf16.len() + 12) / 13).clamp(1, 6)
+    } else {
+        0
+    };
+    if utf16.len() < lfn_slots_count * 13 {
+        utf16.push(0x0000);
+        while utf16.len() < lfn_slots_count * 13 {
+            utf16.push(0xFFFF);
+        }
+    }
+
+    let total_entries = lfn_slots_count + 1;
+    let base_lba = vol.cluster_to_lba(vol.root_cluster);
+    let mut dir_buf = [0u8; SECTOR_SIZE];
+
+    // Find `total_entries` contiguous free 32-byte slots within a root directory sector
+    for s in 0..(vol.sectors_per_cluster as u32) {
+        let lba = base_lba + s;
+        if !sd::read_sector(lba, &mut dir_buf) {
+            continue;
+        }
+        let mut run_start = 0usize;
+        let mut run_len = 0usize;
+        for idx in 0..16 {
+            let b0 = dir_buf[idx * 32];
+            if b0 == 0x00 || b0 == 0xE5 {
+                if run_len == 0 {
+                    run_start = idx;
+                }
+                run_len += 1;
+                if run_len >= total_entries {
+                    break;
+                }
+            } else {
+                run_len = 0;
+            }
+        }
+
+        if run_len >= total_entries {
+            let byte_offs: [usize; 13] = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+            // Write LFN slots in reverse order (`lfn_slots_count` down to `1`)
+            for pos in 0..lfn_slots_count {
+                let seq = lfn_slots_count - pos;
+                let ent_off = (run_start + pos) * 32;
+                let ent = &mut dir_buf[ent_off..ent_off + 32];
+                ent.fill(0);
+                ent[0] = (seq as u8) | if pos == 0 { 0x40 } else { 0x00 };
+                ent[11] = 0x0F; // VFAT LFN attribute
+                ent[12] = 0x00;
+                ent[13] = cksum;
+                let u16_base = (seq - 1) * 13;
+                for (ci, &bo) in byte_offs.iter().enumerate() {
+                    let code = utf16.get(u16_base + ci).copied().unwrap_or(0xFFFF);
+                    let le = code.to_le_bytes();
+                    ent[bo] = le[0];
+                    ent[bo + 1] = le[1];
+                }
+            }
+
+            // Write 8.3 short entry immediately after LFN entries
+            let short_off = (run_start + lfn_slots_count) * 32;
+            let sent = &mut dir_buf[short_off..short_off + 32];
+            sent.fill(0);
+            sent[0..11].copy_from_slice(&short_raw);
+            sent[11] = 0x20; // Archive attribute
+            let hi = ((first_cluster >> 16) as u16).to_le_bytes();
+            let lo = ((first_cluster & 0xFFFF) as u16).to_le_bytes();
+            sent[20..22].copy_from_slice(&hi);
+            sent[26..28].copy_from_slice(&lo);
+            sent[28..32].copy_from_slice(&(data.len() as u32).to_le_bytes());
+
+            return sd::write_sector(lba, &dir_buf);
+        }
+    }
+
+    false
+}
+
 // ─── String formatting helpers ───
 
 fn format_short_name(raw: &[u8]) -> String {

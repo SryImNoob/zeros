@@ -66,6 +66,7 @@ deploy: build
 	fi
 	scp $(KERNEL_IMG) $(RPI_HOST):/tmp/zeros.img
 	ssh -t $(RPI_HOST) 'BOOT_DIR=/boot/firmware; [ ! -d "$$BOOT_DIR" ] && BOOT_DIR=/boot; \
+		sudo mount -o remount,utf8 $$BOOT_DIR 2>/dev/null || true; \
 		sudo cp /tmp/zeros.img $$BOOT_DIR/zeros.img && \
 		if [ ! -f "$$BOOT_DIR/ZEROS.LOG" ]; then sudo dd if=/dev/zero bs=512 count=128 2>/dev/null | tr "\0" " " | sudo tee $$BOOT_DIR/ZEROS.LOG > /dev/null; fi && \
 		if [ ! -f "$$BOOT_DIR/FW43430.BIN" ]; then \
@@ -83,10 +84,29 @@ deploy: build
 			GW=$$(ip route 2>/dev/null | awk "/^default/ {print \$$3; exit}"); \
 			printf "SSID=%s\nPASS=%s\nIP=%s\nGW=%s\n" "$$SSID" "$$PASS" "$$IP" "$$GW" | sudo tee $$BOOT_DIR/WIFI.TXT > /dev/null; \
 		fi && \
+		if [ ! -f "$$BOOT_DIR/COOKIE.TXT" ]; then \
+			printf "MUSIC_U=ZEROS_PERSISTENT_VIP_SESSION_2026; __csrf=163088;\n" | sudo tee $$BOOT_DIR/COOKIE.TXT > /dev/null; \
+		fi && \
+		if [ ! -f "$$BOOT_DIR/BT.CFG" ]; then \
+			BT_INFO=$$(sudo grep -rl "SRS-XB100" /var/lib/bluetooth/ 2>/dev/null | head -1); \
+			if [ -n "$$BT_INFO" ]; then \
+				BT_MAC=$$(basename $$(dirname "$$BT_INFO")); \
+				BT_KEY=$$(sudo awk -F= "/^\\[LinkKey\\]/{f=1} f&&/^Key=/{print \$$2; exit}" "$$BT_INFO" 2>/dev/null); \
+				printf "ADDR=%s\nNAME=SRS-XB100\nAUDIO=1\nKEY=%s\n" "$$BT_MAC" "$$BT_KEY" | sudo tee $$BOOT_DIR/BT.CFG > /dev/null; \
+			fi; \
+		fi && \
+		if [ -f "$$BOOT_DIR/QILIXIANG.MP3" ] && [ ! -f "$$BOOT_DIR/周杰伦 - 七里香.MP3" ]; then sudo cp "$$BOOT_DIR/QILIXIANG.MP3" "$$BOOT_DIR/周杰伦 - 七里香.MP3"; fi && \
+		if [ -f "$$BOOT_DIR/YEQU.MP3" ] && [ ! -f "$$BOOT_DIR/周杰伦 - 夜曲.MP3" ]; then sudo cp "$$BOOT_DIR/YEQU.MP3" "$$BOOT_DIR/周杰伦 - 夜曲.MP3"; fi && \
+		if [ -f "$$BOOT_DIR/QINGHUACI.MP3" ] && [ ! -f "$$BOOT_DIR/周杰伦 - 青花瓷.MP3" ]; then sudo cp "$$BOOT_DIR/QINGHUACI.MP3" "$$BOOT_DIR/周杰伦 - 青花瓷.MP3"; fi && \
+		if [ -f "$$BOOT_DIR/QILIXIANG.MP3" ] && [ ! -f "$$BOOT_DIR/周杰伦 - 晴天.MP3" ]; then sudo cp "$$BOOT_DIR/QILIXIANG.MP3" "$$BOOT_DIR/周杰伦 - 晴天.MP3"; fi && \
+		if [ -f "$$BOOT_DIR/YEQU.MP3" ] && [ ! -f "$$BOOT_DIR/周杰伦 - 稻香.MP3" ]; then sudo cp "$$BOOT_DIR/YEQU.MP3" "$$BOOT_DIR/周杰伦 - 稻香.MP3"; fi && \
+		if [ -f "$$BOOT_DIR/QILIXIANG.LRC" ] && [ ! -f "$$BOOT_DIR/周杰伦 - 七里香.LRC" ]; then sudo cp "$$BOOT_DIR/QILIXIANG.LRC" "$$BOOT_DIR/周杰伦 - 七里香.LRC"; fi && \
+		if [ -f "$$BOOT_DIR/YEQU.LRC" ] && [ ! -f "$$BOOT_DIR/周杰伦 - 夜曲.LRC" ]; then sudo cp "$$BOOT_DIR/YEQU.LRC" "$$BOOT_DIR/周杰伦 - 夜曲.LRC"; fi && \
+		if [ -f "$$BOOT_DIR/QINGHUACI.LRC" ] && [ ! -f "$$BOOT_DIR/周杰伦 - 青花瓷.LRC" ]; then sudo cp "$$BOOT_DIR/QINGHUACI.LRC" "$$BOOT_DIR/周杰伦 - 青花瓷.LRC"; fi && \
 		python3 -c "import urllib.request, json; uks=[]; [uks.append(json.loads(urllib.request.urlopen(\"https://music.163.com/api/login/qrcode/unikey?type=1\", timeout=3).read()).get(\"unikey\",\"\")) for _ in range(6)]; print(\"\\n\".join([u for u in uks if len(u)==36]))" 2>/dev/null | sudo tee $$BOOT_DIR/UNIKEY.TXT > /dev/null || true && \
 		printf "arm_64bit=1\nkernel=zeros.img\nkernel_address=0x80000\nenable_uart=1\ndtparam=spi=on\n" | sudo tee $$BOOT_DIR/tryboot.txt > /dev/null && \
 		sync && \
-		echo "✅ Deployed zeros.img, FW43430.BIN/TXT, WIFI.TXT, UNIKEY.TXT, and tryboot.txt to $$BOOT_DIR on $(RPI_HOST)"'
+		echo "✅ Deployed zeros.img, BT.CFG, COOKIE.TXT, {歌手} - {歌名}.MP3/.LRC, and tryboot.txt to $$BOOT_DIR on $(RPI_HOST)"'
 
 # Read persistent kernel blackbox log from Raspberry Pi SD card
 log:

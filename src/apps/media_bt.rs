@@ -29,10 +29,30 @@ pub struct MediaBtApp {
 
 impl MediaBtApp {
     pub fn new() -> Self {
+        let bt = bluetooth::status();
+        let mut status_banner = String::from("按 B4 [4.搜索] 扫描周围蓝牙设备");
+        if let Some(idx) = bt.connected_index {
+            if idx < bt.device_count {
+                status_banner.clear();
+                let _ = write!(
+                    status_banner,
+                    "已自动连接 A2DP音频: {} (0x{:02X})",
+                    bt.devices[idx].name_str(),
+                    bt.acl_handle & 0xFF
+                );
+            }
+        } else if bt.device_count > 0 && bt.devices[0].valid {
+            status_banner.clear();
+            let _ = write!(
+                status_banner,
+                "已记住音箱: {} · 按 3.连接 或 4.搜索",
+                bt.devices[0].name_str()
+            );
+        }
         Self {
             cursor: 0,
             scroll: 0,
-            status_banner: String::from("按 B4 [4.搜索] 扫描周围蓝牙设备"),
+            status_banner,
             is_busy: false,
         }
     }
