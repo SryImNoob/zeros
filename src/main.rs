@@ -26,6 +26,7 @@ pub mod fs;
 pub mod gfx;
 pub mod kernel;
 pub mod mm;
+pub mod net;
 pub mod sync;
 pub mod ui;
 
@@ -122,6 +123,10 @@ pub extern "C" fn kernel_main() -> ! {
         }
     }
     drivers::bluetooth::init();
+    if !bsp::is_qemu() {
+        tryboot::watchdog_feed(15);
+    }
+    net::init();
     if !bsp::is_qemu() {
         tryboot::watchdog_feed(15);
     }

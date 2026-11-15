@@ -20,7 +20,9 @@ use crate::drivers::bluetooth::{self, AvrcpAction};
 use crate::drivers::display::{colors, Color};
 use crate::fs::fat32;
 use crate::gfx::Canvas;
+use crate::net::{self, NeteaseQrState};
 
+#[derive(Clone)]
 struct LyricLine {
     time_sec: u32,
     text: String,
@@ -29,7 +31,7 @@ struct LyricLine {
 struct SongTrack {
     title: String,
     sd_file: Option<String>,
-    lrc_file: Option<String>,
+    cached_lyrics: Vec<LyricLine>,
     duration_sec: u32,
     format_info: &'static str,
 }
@@ -95,72 +97,107 @@ pub struct MusicApp {
     anim_tick: u32,
     show_playlist: bool,
     show_qr_login: bool,
+    header_dirty: bool,
     qr_nonce: u8,
+    qr_url: String,
     netease_logged_in: bool,
+    cloud_tracks_loaded: bool,
     playlist_cursor: usize,
 }
 
 impl MusicApp {
     pub fn new() -> Self {
+        let mut root_entries = Vec::new();
+        if fat32::is_mounted() {
+            root_entries = fat32::list_root();
+        }
+        let find_sd_audio = |mp3_name: &str, wav_name: &str| -> Option<String> {
+            for ent in root_entries.iter() {
+                if !ent.is_dir && ent.size >= 1024 {
+                    let u = ent.name.to_ascii_uppercase();
+                    if u == mp3_name || u == wav_name {
+                        let mut p = String::from("/");
+                        p.push_str(&ent.name);
+                        return Some(p);
+                    }
+                }
+            }
+            None
+        };
+        let load_lrc_once = |lrc_name: &str, fallback_lrc: &str| -> Vec<LyricLine> {
+            for ent in root_entries.iter() {
+                if !ent.is_dir && ent.name.to_ascii_uppercase() == lrc_name {
+                    let mut p = String::from("/");
+                    p.push_str(&ent.name);
+                    if let Some(raw) = fat32::read_file(&p)
+                        .and_then(|b| core::str::from_utf8(&b).ok().map(String::from))
+                    {
+                        return Self::parse_lrc(&raw);
+                    }
+                }
+            }
+            Self::parse_lrc(fallback_lrc)
+        };
+
         let mut tracks = Vec::new();
         tracks.push(SongTrack {
             title: String::from("1/3 七里香 - 周杰伦"),
-            sd_file: Some(String::from("/QILIXIANG.MP3")),
-            lrc_file: Some(String::from("/QILIXIANG.LRC")),
+            sd_file: find_sd_audio("QILIXIANG.MP3", "QILIXIANG.WAV"),
+            cached_lyrics: load_lrc_once("QILIXIANG.LRC", DEFAULT_QILIXIANG_LRC),
             duration_sec: 85,
             format_info: "MP3 320k",
         });
         tracks.push(SongTrack {
             title: String::from("2/3 夜曲 - 周杰伦"),
-            sd_file: Some(String::from("/YEQU.MP3")),
-            lrc_file: Some(String::from("/YEQU.LRC")),
+            sd_file: find_sd_audio("YEQU.MP3", "YEQU.WAV"),
+            cached_lyrics: load_lrc_once("YEQU.LRC", DEFAULT_YEQU_LRC),
             duration_sec: 76,
             format_info: "MP3 320k",
         });
         tracks.push(SongTrack {
             title: String::from("3/3 青花瓷 - 周杰伦"),
-            sd_file: Some(String::from("/QINGHUACI.MP3")),
-            lrc_file: Some(String::from("/QINGHUACI.LRC")),
+            sd_file: find_sd_audio("QINGHUACI.MP3", "QINGHUACI.WAV"),
+            cached_lyrics: load_lrc_once("QINGHUACI.LRC", DEFAULT_QINGHUACI_LRC),
             duration_sec: 80,
             format_info: "MP3 320k",
         });
 
         // Discover any additional `.MP3` / `.WAV` files placed by the user in FAT32 root
-        if fat32::is_mounted() {
-            for ent in fat32::list_root() {
-                if ent.is_dir || ent.size < 1024 {
-                    continue;
-                }
-                let upper = ent.name.to_ascii_uppercase();
-                let is_audio = upper.ends_with(".MP3") || upper.ends_with(".WAV");
-                let is_builtin = upper == "QILIXIANG.MP3"
-                    || upper == "QILIXIANG.WAV"
-                    || upper == "YEQU.MP3"
-                    || upper == "YEQU.WAV"
-                    || upper == "QINGHUACI.MP3"
-                    || upper == "QINGHUACI.WAV";
-                if is_audio && !is_builtin && tracks.len() < 8 {
-                    let mut path = String::from("/");
-                    path.push_str(&ent.name);
-                    let mut title = String::new();
-                    let idx_num = tracks.len() + 1;
-                    let _ = write!(title, "{}. {}", idx_num, ent.name);
-                    tracks.push(SongTrack {
-                        title,
-                        sd_file: Some(path),
-                        lrc_file: None,
-                        duration_sec: ((ent.size / 16_000) as u32).max(10),
-                        format_info: if upper.ends_with(".WAV") {
-                            "WAV PCM"
-                        } else {
-                            "MP3 SD"
-                        },
-                    });
-                }
+        for ent in root_entries.iter() {
+            if ent.is_dir || ent.size < 1024 {
+                continue;
+            }
+            let upper = ent.name.to_ascii_uppercase();
+            let is_audio = upper.ends_with(".MP3") || upper.ends_with(".WAV");
+            let is_builtin = upper == "QILIXIANG.MP3"
+                || upper == "QILIXIANG.WAV"
+                || upper == "YEQU.MP3"
+                || upper == "YEQU.WAV"
+                || upper == "QINGHUACI.MP3"
+                || upper == "QINGHUACI.WAV";
+            if is_audio && !is_builtin && tracks.len() < 8 {
+                let mut path = String::from("/");
+                path.push_str(&ent.name);
+                let mut title = String::new();
+                let idx_num = tracks.len() + 1;
+                let _ = write!(title, "{}. {}", idx_num, ent.name);
+                tracks.push(SongTrack {
+                    title,
+                    sd_file: Some(path),
+                    cached_lyrics: Self::parse_lrc(DEFAULT_QILIXIANG_LRC),
+                    duration_sec: ((ent.size / 16_000) as u32).max(10),
+                    format_info: if upper.ends_with(".WAV") {
+                        "WAV PCM"
+                    } else {
+                        "MP3 SD"
+                    },
+                });
             }
         }
 
-        let has_cookie = fat32::is_mounted() && fat32::read_file("/COOKIE.TXT").is_some();
+        let has_cookie = root_entries
+            .iter()
+            .any(|e| !e.is_dir && e.name.to_ascii_uppercase() == "COOKIE.TXT");
 
         let mut app = Self {
             tracks,
@@ -172,31 +209,43 @@ impl MusicApp {
             anim_tick: 0,
             show_playlist: false,
             show_qr_login: false,
+            header_dirty: false,
             qr_nonce: 1,
+            qr_url: String::from(
+                "https://music.163.com/login?codekey=8f4a2e01-9c3b-4d71-a52e-6019b8c4e712",
+            ),
             netease_logged_in: has_cookie,
+            cloud_tracks_loaded: false,
             playlist_cursor: 0,
         };
+        if has_cookie {
+            app.sync_cloud_playlist();
+        }
         app.activate_current_track();
         app
     }
 
-    fn load_lyrics_for_track(&self, track_idx: usize) -> Vec<LyricLine> {
-        if let Some(track) = self.tracks.get(track_idx) {
-            if let Some(ref lrc_path) = track.lrc_file {
-                if fat32::is_mounted() {
-                    if let Some(raw) = fat32::read_file(lrc_path)
-                        .and_then(|b| core::str::from_utf8(&b).ok().map(String::from))
-                    {
-                        return Self::parse_lrc(&raw);
-                    }
-                }
+    fn sync_cloud_playlist(&mut self) {
+        if self.cloud_tracks_loaded {
+            return;
+        }
+        self.cloud_tracks_loaded = true;
+        let cloud_list = net::fetch_cloud_playlist();
+        for item in cloud_list {
+            if self.tracks.len() < 8 {
+                self.tracks.push(SongTrack {
+                    title: item.title,
+                    sd_file: None,
+                    cached_lyrics: Self::parse_lrc(&item.lrc),
+                    duration_sec: item.duration_sec,
+                    format_info: "Cloud 320k",
+                });
             }
         }
-        match track_idx {
-            0 => Self::parse_lrc(DEFAULT_QILIXIANG_LRC),
-            1 => Self::parse_lrc(DEFAULT_YEQU_LRC),
-            _ => Self::parse_lrc(DEFAULT_QINGHUACI_LRC),
-        }
+    }
+
+    pub fn is_overlay_open(&self) -> bool {
+        self.show_playlist || self.show_qr_login
     }
 
     fn activate_current_track(&mut self) {
@@ -204,10 +253,13 @@ impl MusicApp {
         let (_kind, dur) = audio::select_track(self.current_track, sd_path.as_deref());
         self.tracks[self.current_track].duration_sec = dur.max(1);
         self.play_pos_sec = 0;
-        self.lyrics = self.load_lyrics_for_track(self.current_track);
+        self.lyrics = self.tracks[self.current_track].cached_lyrics.clone();
         self.last_rendered_lrc = usize::MAX;
-        bluetooth::set_a2dp_playback(self.playing, self.current_track, 0);
+        self.header_dirty = true;
         audio::refill_pcm_ring();
+        bluetooth::set_a2dp_playback(self.playing, self.current_track, 0);
+        bluetooth::refill_sbc_pkt_ring();
+        bluetooth::pump_a2dp_audio();
     }
 
     pub fn play_track(&mut self, title: String) {
@@ -429,32 +481,40 @@ impl MusicApp {
         canvas.fill_rrect(14, 52, 292, 140, 6, colors::rgb(14, 21, 36));
         canvas.stroke_rrect(14, 52, 292, 140, 6, colors::rgb(235, 70, 85));
 
-        let mut qr_url = String::with_capacity(80);
-        let _ = write!(
-            qr_url,
-            "https://music.163.com/login?codekey=8f4a2e{:02x}-9c3b-4d71-a52e-6019b8c4e712",
-            self.qr_nonce
-        );
         // Version 4 QR code is 33x33 modules; with 3-module quiet zone = 39*3 = 117x117 px
-        canvas.draw_qr_code(22, 63, &qr_url, 3);
+        canvas.draw_qr_code(22, 63, &self.qr_url, 3);
 
-        canvas.draw_mixed_text(148, 62, "网易云音乐扫码登录", colors::rgb(255, 110, 120), 14);
-        canvas.draw_mixed_text(148, 84, "请打开手机网易云音乐", colors::rgb(215, 230, 250), 12);
-        canvas.draw_mixed_text(148, 102, "扫一扫左侧二维码登录", colors::rgb(215, 230, 250), 12);
+        let nst = net::status();
+        canvas.draw_mixed_text(148, 60, "网易云音乐扫码登录", colors::rgb(255, 110, 120), 14);
+        let mut net_line = String::with_capacity(28);
+        let _ = write!(
+            net_line,
+            "API {}.{}.{}.{}:80",
+            nst.netease_ip[0], nst.netease_ip[1], nst.netease_ip[2], nst.netease_ip[3]
+        );
+        canvas.draw_str_ascii(148, 82, &net_line, colors::rgb(100, 225, 255));
+        canvas.draw_mixed_text(148, 98, "扫一扫左侧二维码登录", colors::rgb(215, 230, 250), 12);
 
-        canvas.fill_rrect(148, 124, 150, 24, 4, colors::rgb(22, 36, 58));
-        if self.netease_logged_in {
-            canvas.draw_mixed_text(154, 130, "状态: 已授权云端歌单", colors::rgb(80, 250, 170), 12);
+        canvas.fill_rrect(148, 120, 150, 24, 4, colors::rgb(22, 36, 58));
+        if self.netease_logged_in || nst.qr_state == NeteaseQrState::Authorized {
+            canvas.draw_mixed_text(154, 126, "状态: 已授权云端歌单", colors::rgb(80, 250, 170), 12);
         } else {
-            canvas.draw_mixed_text(154, 130, "状态: 等待手机扫码", colors::rgb(255, 210, 80), 12);
+            canvas.draw_mixed_text(154, 126, "状态: 等待手机扫码", colors::rgb(255, 210, 80), 12);
         }
-        canvas.draw_mixed_text(148, 158, "按 1.刷新  3.授权  4.返回", colors::rgb(145, 172, 210), 12);
+        canvas.draw_mixed_text(148, 156, "按 1.刷新  3.授权  4.返回", colors::rgb(145, 172, 210), 12);
     }
 
-    /// Lightweight partial redraw called on 200ms animation ticks so SPI0 only flushes changed rows.
+    /// Lightweight partial redraw called on 200ms animation ticks (and fast B1/B3 track switches)
+    /// so SPI0 only flushes changed rows.
     pub fn render_dynamic(&mut self, canvas: &mut Canvas) {
         if self.show_playlist || self.show_qr_login {
             return;
+        }
+        if self.header_dirty {
+            self.header_dirty = false;
+            canvas.fill_rect(72, 32, 148, 20, colors::rgb(19, 28, 46));
+            let track_title = self.tracks[self.current_track].title.clone();
+            canvas.draw_mixed_text(74, 34, &track_title, colors::WHITE, 14);
         }
         self.draw_vinyl_and_spectrum(canvas);
         let active_lrc = self.active_lrc_index();
@@ -615,8 +675,9 @@ impl App for MusicApp {
         if self.show_qr_login {
             return match slot {
                 0 => {
-                    // 1.刷新二维码
+                    // 1.刷新二维码 (TCP/HTTP unikey request to music.163.com)
                     self.qr_nonce = self.qr_nonce.wrapping_add(17);
+                    self.qr_url = net::refresh_netease_qr_url(self.qr_nonce);
                     AppIntent::None
                 }
                 1 => {
@@ -626,9 +687,12 @@ impl App for MusicApp {
                     AppIntent::None
                 }
                 2 => {
-                    // 3.确认授权并持久化 Cookie
+                    // 3.确认授权并持久化 Cookie + 拉取网易云歌单
+                    let _ = net::poll_netease_qr_login(true);
                     self.netease_logged_in = true;
-                    let _ = fat32::write_small_file("/COOKIE.TXT", b"MUSIC_U=ZEROS_VIP_TOKEN_2026;\n");
+                    let _ =
+                        fat32::write_small_file("/COOKIE.TXT", b"MUSIC_U=ZEROS_VIP_TOKEN_2026;\n");
+                    self.sync_cloud_playlist();
                     AppIntent::None
                 }
                 _ => {
@@ -661,6 +725,7 @@ impl App for MusicApp {
                         self.activate_current_track();
                         AppIntent::None
                     } else if self.playlist_cursor == self.tracks.len() {
+                        self.qr_url = net::refresh_netease_qr_url(self.qr_nonce);
                         self.show_qr_login = true;
                         AppIntent::None
                     } else {
@@ -772,6 +837,9 @@ impl App for MusicApp {
 
     fn on_tick_200ms(&mut self, sub_tick: u32, is_active: bool) -> bool {
         self.anim_tick = self.anim_tick.wrapping_add(1);
+        if sub_tick == 0 {
+            net::poll_rx();
+        }
         if sub_tick % 5 == 0 && self.playing {
             let dur = self.tracks[self.current_track].duration_sec.max(1);
             if self.play_pos_sec + 1 >= dur {

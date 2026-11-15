@@ -136,9 +136,17 @@ impl DesktopShell {
                 // Scheme B: Short-press B1..B4 executes the 4 in-page actions (0..=3) of the active app
                 self.system_app.set_last_button(Some(btn));
                 let slot = (btn as usize) & 3;
+                let fast_music_switch = self.active_app == AppId::Music
+                    && !self.music_app.is_overlay_open()
+                    && (slot == 0 || slot == 2)
+                    && self.music_app.is_playing();
                 let intent = self.current_app_mut().on_slot_action(slot);
                 self.dispatch_intent(intent);
-                self.needs_full_redraw = true;
+                if fast_music_switch {
+                    self.needs_dynamic_redraw = true;
+                } else {
+                    self.needs_full_redraw = true;
+                }
             }
             InputEvent::ButtonLongPress(btn) => {
                 self.system_app.set_last_button(Some(btn));

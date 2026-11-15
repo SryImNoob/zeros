@@ -128,6 +128,16 @@ unsafe fn route_emmc_to_sdcard() {
     mmio::write(GPFSEL5, fsel5);
 }
 
+/// Fast (< 1 µs) pinmux restore: switches Arasan EMMC back to the microSD card (`GPIO 48..53`)
+/// after a short Wi-Fi SDIO transaction on `GPIO 34..39`, without resetting the SD card state.
+pub fn restore_pinmux() {
+    unsafe {
+        if !crate::bsp::is_qemu() {
+            route_emmc_to_sdcard();
+        }
+    }
+}
+
 /// Initialize the EMMC controller and SD card.
 /// Returns `true` if a card was detected and initialized.
 pub fn init() -> bool {

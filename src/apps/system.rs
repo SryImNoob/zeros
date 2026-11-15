@@ -258,7 +258,7 @@ impl App for SystemApp {
             }
         }
 
-        let mut tc_str = String::with_capacity(20);
+        let mut tc_str = String::with_capacity(24);
         if let Some((tx, ty)) = self.last_touch {
             let _ = write!(
                 tc_str,
@@ -268,7 +268,12 @@ impl App for SystemApp {
                 touch::is_touched() as u8
             );
         } else {
-            let _ = write!(tc_str, "Touch Pad Ready");
+            let nst = crate::net::status();
+            let _ = write!(
+                tc_str,
+                "IP:{}.{}.{}.{} T:{}",
+                nst.local_ip[0], nst.local_ip[1], nst.local_ip[2], nst.local_ip[3], nst.tx_packets
+            );
         }
         canvas.draw_str_ascii(172, 215, &tc_str, colors::rgb(200, 220, 250));
     }

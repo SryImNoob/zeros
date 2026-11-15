@@ -242,19 +242,24 @@ pub unsafe fn pop_pcm_128(out_lr: &mut [[i16; 128]; 2], fallback_track: u8, samp
         let tot = PLAYED_SAMPLES_TOTAL.load(Ordering::Relaxed).wrapping_add(128);
         PLAYED_SAMPLES_TOTAL.store(tot, Ordering::Relaxed);
     } else {
-        // Fallback: synthesize 128 stereo PCM samples directly
+        // Fallback: synthesize 128 stereo PCM samples directly and keep ENGINE.synth_cursor in sync
         synthesize_pcm_128(out_lr, fallback_track, sample_cursor, vol);
+        ENGINE.with(|e| {
+            if e.synth_cursor < *sample_cursor {
+                e.synth_cursor = *sample_cursor;
+            }
+        });
     }
 }
 
-/// Load a built-in track (`0..=2`) or try loading a matching `.MP3` / `.WAV` file from FAT32 SD card.
+/// Load a built-in track (`0..=2`) or load an existing `.MP3` / `.WAV` file from FAT32 SD card.
 pub fn select_track(track_idx: usize, sd_filename: Option<&str>) -> (SourceKind, u32) {
-    flush_pcm_ring();
-    PLAYED_SAMPLES_TOTAL.store(0, Ordering::Relaxed);
-
+    // If loading a real SD audio file, read it BEFORE flushing PCM_RING so audio doesn't gap during I/O
     if let Some(fname) = sd_filename {
         if fat32::is_mounted() {
             if let Some(bytes) = fat32::read_file(fname) {
+                flush_pcm_ring();
+                PLAYED_SAMPLES_TOTAL.store(0, Ordering::Relaxed);
                 if let Some((kind, dur)) = load_audio_bytes_internal(fname, bytes) {
                     return (kind, dur);
                 }
@@ -262,21 +267,8 @@ pub fn select_track(track_idx: usize, sd_filename: Option<&str>) -> (SourceKind,
         }
     }
 
-    // Try standard SD card audio filenames for Track 0..2 (`/QILIXIANG.MP3`, `/YEQU.MP3`, `/QINGHUACI.MP3`)
-    let candidates: [&str; 2] = match track_idx {
-        0 => ["/QILIXIANG.MP3", "/QILIXIANG.WAV"],
-        1 => ["/YEQU.MP3", "/YEQU.WAV"],
-        _ => ["/QINGHUACI.MP3", "/QINGHUACI.WAV"],
-    };
-    if fat32::is_mounted() {
-        for &path in &candidates {
-            if let Some(bytes) = fat32::read_file(path) {
-                if let Some((kind, dur)) = load_audio_bytes_internal(path, bytes) {
-                    return (kind, dur);
-                }
-            }
-        }
-    }
+    flush_pcm_ring();
+    PLAYED_SAMPLES_TOTAL.store(0, Ordering::Relaxed);
 
     let dur = match track_idx {
         0 => 85,
@@ -637,8 +629,11 @@ fn decode_wav_chunk(target_fill: usize) {
 
 fn synth_chunk_to_ring(track_idx: u8, target_fill: usize) {
     let mut chunks = 0usize;
+    // When ring was just flushed (e.g. track switch), synthesize 80 chunks (10,240 samples = 232ms)
+    // in one shot so `refill_sbc_pkt_ring()` has 100% contiguous PCM samples from `PCM_RING`.
+    let max_chunks = if buffered_frames() < 8_192 { 80 } else { 16 };
     let mut lr = [[0i16; 128]; 2];
-    while buffered_frames() < target_fill && chunks < 16 {
+    while buffered_frames() < target_fill && chunks < max_chunks {
         chunks += 1;
         let mut cur = ENGINE.with(|e| e.synth_cursor);
         unsafe {
@@ -793,8 +788,9 @@ unsafe fn synthesize_pcm_128(
             0
         };
 
-        let l_raw = ((mel * 11 + chd * 5 + bas * 6 + hat * 2) / 8) * vol_pct / 100;
-        let r_raw = ((mel * 11 + chd * 7 + bas * 4 + hat * 3) / 8) * vol_pct / 100;
+        let fade_in = if s_idx < 256 { s_idx as i32 } else { 256 };
+        let l_raw = ((mel * 11 + chd * 5 + bas * 6 + hat * 2) / 8) * vol_pct * fade_in / (100 * 256);
+        let r_raw = ((mel * 11 + chd * 7 + bas * 4 + hat * 3) / 8) * vol_pct * fade_in / (100 * 256);
         out_lr[0][i] = l_raw.clamp(-30000, 30000) as i16;
         out_lr[1][i] = r_raw.clamp(-30000, 30000) as i16;
     }
