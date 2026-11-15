@@ -20,6 +20,7 @@ pub mod drivers;
 
 pub mod apps;
 pub mod arch;
+pub mod audio;
 pub mod bsp;
 pub mod fs;
 pub mod gfx;

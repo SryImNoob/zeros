@@ -18,13 +18,13 @@ use crate::mm::page_alloc::{self, PAGE_SIZE};
 /// Maximum number of concurrent kernel tasks
 pub const MAX_TASKS: usize = 16;
 
-/// Stack size per task in pages (4 pages = 16 KB)
-const STACK_PAGES: usize = 4;
+/// Stack size per task in pages (16 pages = 64 KB)
+const STACK_PAGES: usize = 16;
 
 /// Time slice per task in 100Hz timer ticks (5 ticks = 50ms)
 pub const TIME_SLICE_TICKS: u64 = 5;
 
-/// Saved CPU callee-saved registers for context switching (AAPCS64)
+/// Saved CPU & FPU callee-saved registers for context switching (AAPCS64)
 #[repr(C)]
 #[derive(Default, Clone, Copy)]
 pub struct TaskContext {
@@ -41,6 +41,14 @@ pub struct TaskContext {
     pub x29: u64, // Frame Pointer (FP)
     pub x30: u64, // Link Register (LR / return address)
     pub sp:  u64, // Stack Pointer (SP_EL1)
+    pub d8:  u64,
+    pub d9:  u64,
+    pub d10: u64,
+    pub d11: u64,
+    pub d12: u64,
+    pub d13: u64,
+    pub d14: u64,
+    pub d15: u64,
 }
 
 /// Task execution state
@@ -80,6 +88,8 @@ impl Task {
                 x23: 0, x24: 0, x25: 0, x26: 0,
                 x27: 0, x28: 0, x29: 0, x30: 0,
                 sp: 0,
+                d8: 0, d9: 0, d10: 0, d11: 0,
+                d12: 0, d13: 0, d14: 0, d15: 0,
             },
             entry: None,
             stack_base: 0,
@@ -106,6 +116,10 @@ __switch_context:
     stp     x29, x30, [x0, #80]
     mov     x9, sp
     str     x9, [x0, #96]
+    stp     d8,  d9,  [x0, #104]
+    stp     d10, d11, [x0, #120]
+    stp     d12, d13, [x0, #136]
+    stp     d14, d15, [x0, #152]
 
     ldp     x19, x20, [x1, #0]
     ldp     x21, x22, [x1, #16]
@@ -115,6 +129,10 @@ __switch_context:
     ldp     x29, x30, [x1, #80]
     ldr     x9, [x1, #96]
     mov     sp, x9
+    ldp     d8,  d9,  [x1, #104]
+    ldp     d10, d11, [x1, #120]
+    ldp     d12, d13, [x1, #136]
+    ldp     d14, d15, [x1, #152]
 
     ret
 "#);

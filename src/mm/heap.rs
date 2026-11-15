@@ -13,8 +13,8 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
 
-/// Heap size: 4 MB (backed by physical memory after kernel image)
-const HEAP_SIZE: usize = 4 * 1024 * 1024;
+/// Heap size: 32 MB (backed by physical memory after kernel image; supports full-song MP3/WAV buffers)
+const HEAP_SIZE: usize = 32 * 1024 * 1024;
 
 /// Minimum block size (must fit FreeNode = 16 bytes)
 const MIN_BLOCK: usize = 32;

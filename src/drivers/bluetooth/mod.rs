@@ -1934,6 +1934,40 @@ unsafe fn handle_acl_l2cap_packet(
                 _ => {}
             }
         }
+    } else if cid == 0x0042 && body.len() >= 6 && cs.avrcp_dcid != 0 {
+        // ─── AVRCP Remote Control Channel (local CID = 0x0042, PSM 0x0017) ───
+        // Handles hardware Play/Pause, Next, Previous, and Volume buttons pressed on the Bluetooth speaker!
+        let avctp_hdr = body[0];
+        let msg_type = (avctp_hdr >> 1) & 0x01; // 0 = Command, 1 = Response
+        if msg_type == 0 && body.len() >= 8 && body[1] == 0x11 && body[2] == 0x0E {
+            let ctype = body[3] & 0x0F;
+            let opcode = body[5];
+            if ctype == 0x00 && opcode == 0x7C {
+                // AV/C PASS THROUGH command (0x7C)
+                let state_op = body[6];
+                let pressed = (state_op & 0x80) == 0;
+                let op_id = state_op & 0x7F;
+                let mut rsp = [0u8; 8];
+                rsp.copy_from_slice(&body[0..8]);
+                rsp[0] = (avctp_hdr & 0xF0) | 0x02; // AVCTP Response bit
+                rsp[3] = 0x09; // AV/C ACCEPTED (0x09)
+                let _ = hci_send_l2cap(handle, cs.avrcp_dcid, &rsp);
+
+                if pressed {
+                    let act = match op_id {
+                        0x44 | 0x46 | 0x45 => 1u32, // PLAY / PAUSE / STOP -> Toggle Play/Pause
+                        0x4B => 2u32,               // FORWARD -> Next Track
+                        0x4C => 3u32,               // BACKWARD -> Prev Track
+                        0x41 => 4u32,               // VOLUME UP
+                        0x42 => 5u32,               // VOLUME DOWN
+                        _ => 0u32,
+                    };
+                    if act != 0 {
+                        PENDING_AVRCP_ACTION.store(act, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
     } else if cid == 0x0044 && body.len() >= 5 && cs.sdp_dcid != 0 {
         // ─── SDP Server Stub (local CID = 0x0044): reply cleanly so speaker's SDP query finishes immediately ───
         let pdu_id = body[0];
@@ -2820,20 +2854,47 @@ pub fn connect_device(idx: usize) -> bool {
     }
 }
 
-// ─── M10.2: Real-Time Bluetooth A2DP SBC Audio Encoder & Media Streamer ───
+// ─── M10.2 / M11.1: Real-Time Bluetooth A2DP 8-Subband SBC Audio Encoder & Media Streamer ───
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AvrcpAction {
+    PlayPause,
+    NextTrack,
+    PrevTrack,
+    VolumeUp,
+    VolumeDown,
+}
+
+static PENDING_AVRCP_ACTION: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Poll any pending hardware button press sent by the Bluetooth speaker over `AVRCP (PSM 0x0017)`.
+pub fn take_avrcp_action() -> Option<AvrcpAction> {
+    let raw = PENDING_AVRCP_ACTION.load(Ordering::Relaxed);
+    if raw == 0 {
+        return None;
+    }
+    PENDING_AVRCP_ACTION.store(0, Ordering::Relaxed);
+    match raw {
+        1 => Some(AvrcpAction::PlayPause),
+        2 => Some(AvrcpAction::NextTrack),
+        3 => Some(AvrcpAction::PrevTrack),
+        4 => Some(AvrcpAction::VolumeUp),
+        5 => Some(AvrcpAction::VolumeDown),
+        _ => None,
+    }
+}
 
 static mut A2DP_SEQ: u16 = 1;
 static mut A2DP_TS: u32 = 0;
 static mut A2DP_SAMPLE_CURSOR: u32 = 0;
 static mut A2DP_NEXT_TICK: u64 = 0;
-static mut A2DP_PHASE_MEL: u32 = 0;
-static mut A2DP_PHASE_CHD: u32 = 0;
-static mut A2DP_PHASE_BAS: u32 = 0;
 static mut RUNTIME_CS: ClassicConnState = ClassicConnState::new();
 static mut RUNTIME_REASM: AclReassembler = AclReassembler::new();
 
 /// Synchronize the `1.听歌` (`MusicApp`) playback state with the Bluetooth A2DP SBC audio streamer.
 pub fn set_a2dp_playback(playing: bool, track_idx: usize, pos_sec: u32) {
+    crate::audio::set_playing(playing);
     STATE.with(|s| {
         let track_changed = s.a2dp_track != (track_idx as u8);
         let resumed = !s.a2dp_playing && playing;
@@ -2852,6 +2913,7 @@ pub fn set_a2dp_playback(playing: bool, track_idx: usize, pos_sec: u32) {
 
 /// Scrub the A2DP audio synthesis cursor to `pos_sec` seconds when the user touches the progress bar.
 pub fn seek_a2dp_playback(pos_sec: u32) {
+    crate::audio::seek_to_sec(pos_sec);
     unsafe {
         A2DP_SAMPLE_CURSOR = pos_sec.wrapping_mul(44_100);
     }
@@ -3080,11 +3142,53 @@ fn sbc_calculate_bits(
     }
 }
 
+/// Standard A2DP Specification Table 12.1 80-tap 8-Subband Prototype Filter $H[0..79]$ (Q15 fixed-point)
+const SBC_PROTO_H80_Q15: [i32; 80] = [
+    0, 5, 11, 18, 27, 37, 48, 58, 66, 69, 65, 53, 30, -6, -54, -115, -185, -263, -343, -418,
+    -480, -521, -532, -502, -424, -290, -96, 165, 491, 882, 1330, 1825, 2353, 2896, 3436, 3949,
+    4412, 4805, 5106, 5297, 5363, 5297, 5106, 4805, 4412, 3949, 3436, 2896, 2353, 1825, 1330,
+    882, 491, 165, -96, -290, -424, -502, -532, -521, -480, -418, -343, -263, -185, -115, -54,
+    -6, 30, 53, 65, 69, 66, 58, 48, 37, 27, 18, 11, 5,
+];
+
+/// $8 \times 16$ Cosine Analysis Modulation Matrix $M[m][i] = \cos((m + 0.5)(i - 8)\pi / 8)$ (Q13 fixed-point)
+const SBC_COS_M8_Q13: [[i32; 16]; 8] = [
+    [
+        3135, 4551, 5793, 6811, 7568, 8035, 8192, 8035, 7568, 6811, 5793, 4551, 3135, 1598, 0,
+        -1598,
+    ],
+    [
+        -7568, -8035, -5793, -1598, 3135, 6811, 8192, 6811, 3135, -1598, -5793, -8035, -7568,
+        -4551, 0, 4551,
+    ],
+    [
+        7568, 1598, -5793, -8035, -3135, 4551, 8192, 4551, -3135, -8035, -5793, 1598, 7568, 6811,
+        0, -6811,
+    ],
+    [
+        -3135, 6811, 5793, -4551, -7568, 1598, 8192, 1598, -7568, -4551, 5793, 6811, -3135, -8035,
+        0, 8035,
+    ],
+    [
+        -3135, -6811, 5793, 4551, -7568, -1598, 8192, -1598, -7568, 4551, 5793, -6811, -3135,
+        8035, 0, -8035,
+    ],
+    [
+        7568, -1598, -5793, 8035, -3135, -4551, 8192, -4551, -3135, 8035, -5793, -1598, 7568,
+        -6811, 0, 6811,
+    ],
+    [
+        -7568, 8035, -5793, 1598, 3135, -6811, 8192, -6811, 3135, 1598, -5793, 8035, -7568, 4551,
+        0, -4551,
+    ],
+    [
+        3135, -4551, 5793, -6811, 7568, -8035, 8192, -8035, 7568, -6811, 5793, -4551, 3135, -1598,
+        0, 1598,
+    ],
+];
+
 /// Encode a single 16-block, 8-subband Bluetooth A2DP SBC frame (`72` bytes in Stereo, `73` in Joint Stereo)
-/// containing phase-continuous polyphonic stereo audio for:
-///   - Track 0: 《七里香 - 周杰伦》 (warm C-major ballad chorus)
-///   - Track 1: 《夜曲 - 周杰伦》 (rhythmic A-minor nocturne arpeggio + rap melody)
-///   - Track 2: 《青花瓷 - 周杰伦》 (bright high-register pentatonic Guzheng/flute melody)
+/// using the full 80-tap polyphase analysis filterbank across all 8 subbands (`0..22.05 kHz`).
 unsafe fn encode_sbc_frame(
     sbc_cap0: u8,
     sbc_cap1: u8,
@@ -3093,156 +3197,86 @@ unsafe fn encode_sbc_frame(
     sample_cursor: &mut u32,
     out: &mut [u8],
 ) -> usize {
-    // Track 0: 《七里香 - 周杰伦》 ("雨下整夜 我的爱溢出就像雨水 / 院子落叶 跟我的思念厚厚一叠...")
-    const QILIXIANG_MELODY: [u16; 32] = [
-        659, 784, 784, 659, 587, 659, 784, 587, // E5 G5 G5 E5 | D5 E5 G5 D5
-        523, 440, 392, 392, 523, 587, 659, 659, // C5 A4 G4 G4 | C5 D5 E5 E5
-        659, 784, 784, 659, 587, 659, 880, 784, // E5 G5 G5 E5 | D5 E5 A5 G5
-        587, 659, 698, 659, 587, 523, 494, 523, // D5 E5 F5 E5 | D5 C5 B4 C5
-    ];
-    const QILIXIANG_CHORD: [u16; 32] = [
-        523, 523, 494, 494, 440, 440, 392, 392, // C5  B4  A4  G4
-        349, 349, 392, 392, 330, 330, 440, 440, // F4  G4  E4  A4
-        349, 349, 392, 392, 330, 330, 440, 440, // F4  G4  E4  A4
-        349, 349, 392, 392, 392, 330, 392, 392, // F4  G4  G4  C4/G4
-    ];
-    const QILIXIANG_BASS: [u16; 32] = [
-        262, 262, 247, 247, 220, 220, 196, 196, // C4  B3  A3  G3
-        175, 175, 196, 196, 165, 165, 220, 220, // F3  G3  E3  A3
-        175, 175, 196, 196, 165, 165, 220, 220, // F3  G3  E3  A3
-        147, 147, 196, 196, 196, 131, 196, 262, // D3  G3  G3  C4
-    ];
-
-    // Track 1: 《夜曲 - 周杰伦》 (distinct lower A-minor acoustic guitar arpeggio + rhythmic chorus)
-    const YEQU_MELODY: [u16; 32] = [
-        440, 523, 659, 880, 784, 659, 523, 494, // A4 C5 E5 A5 | G5 E5 C5 B4
-        440, 494, 523, 659, 587, 523, 494, 392, // A4 B4 C5 E5 | D5 C5 B4 G4
-        349, 440, 523, 698, 659, 523, 440, 392, // F4 A4 C5 F5 | E5 C5 A4 G4
-        330, 415, 494, 659, 587, 523, 494, 440, // E4 G#4 B4 E5 | D5 C5 B4 A4
-    ];
-    const YEQU_CHORD: [u16; 32] = [
-        330, 440, 330, 440, 294, 392, 294, 392, // Am / Em
-        349, 440, 349, 440, 330, 392, 330, 392, // F  / C
-        294, 349, 294, 349, 262, 330, 262, 330, // Dm / Am
-        247, 330, 247, 330, 220, 330, 220, 330, // E7 / Am
-    ];
-    const YEQU_BASS: [u16; 32] = [
-        220, 220, 220, 220, 165, 165, 165, 165, // A3 / E3
-        175, 175, 175, 175, 131, 131, 131, 131, // F3 / C3
-        147, 147, 147, 147, 220, 220, 220, 220, // D3 / A3
-        165, 165, 165, 165, 220, 220, 220, 220, // E3 / A3
-    ];
-
-    // Track 2: 《青花瓷 - 周杰伦》 ("天青色等烟雨 而我在等你 / 炊烟袅袅升起 隔江千万里...")
-    const QINGHUACI_MELODY: [u16; 32] = [
-        880, 784, 659, 587, 523, 587, 659, 784, // A5 G5 E5 D5 | C5 D5 E5 G5
-        659, 587, 523, 440, 392, 440, 523, 523, // E5 D5 C5 A4 | G4 A4 C5 C5
-        587, 659, 784, 880, 784, 659, 587, 523, // D5 E5 G5 A5 | G5 E5 D5 C5
-        587, 659, 523, 440, 392, 440, 523, 523, // D5 E5 C5 A4 | G4 A4 C5 C5
-    ];
-    const QINGHUACI_CHORD: [u16; 32] = [
-        523, 523, 392, 392, 440, 440, 330, 330, // C5  G4  A4  E4
-        349, 349, 392, 392, 523, 523, 392, 392, // F4  G4  C5  G4
-        349, 349, 392, 392, 330, 330, 440, 440, // F4  G4  E4  A4
-        294, 294, 392, 392, 523, 523, 523, 523, // D4  G4  C5  C5
-    ];
-    const QINGHUACI_BASS: [u16; 32] = [
-        262, 262, 196, 196, 220, 220, 165, 165, // C4  G3  A3  E3
-        175, 175, 196, 196, 262, 262, 196, 196, // F3  G3  C4  G3
-        175, 175, 196, 196, 165, 165, 220, 220, // F3  G3  E3  A3
-        147, 147, 196, 196, 262, 262, 262, 262, // D3  G3  C4  C4
-    ];
-
-    let (freq_idx, sample_rate) = if (sbc_cap0 & 0x80) != 0 {
-        (0usize, 16_000u32)
+    let freq_idx = if (sbc_cap0 & 0x80) != 0 {
+        0usize
     } else if (sbc_cap0 & 0x40) != 0 {
-        (1usize, 32_000u32)
+        1usize
     } else if (sbc_cap0 & 0x10) != 0 {
-        (3usize, 48_000u32)
+        3usize
     } else {
-        (2usize, 44_100u32)
+        2usize
     };
 
     let ch_mode = sbc_cap0 & 0x0F;
     let num_ch = if ch_mode == 0x08 { 1usize } else { 2usize };
     let alloc_snr = (sbc_cap1 & 0x02) != 0;
 
-    // Synthesize 16 subband blocks (`16 * 8 = 128` PCM samples per SBC frame) using continuous Q24 phase accumulators
+    static mut A2DP_PCM_LR: [[i16; 128]; 2] = [[0i16; 128]; 2];
+    static mut A2DP_DELAY_X: [[i32; 80]; 2] = [[0i32; 80]; 2];
     static mut A2DP_SB_SAMPLES: [[[i32; 8]; 2]; 16] = [[[0i32; 8]; 2]; 16];
+
+    let pcm_lr = &mut *(&raw mut A2DP_PCM_LR);
+    let delay_x = &mut *(&raw mut A2DP_DELAY_X);
     let sb_samples = &mut *(&raw mut A2DP_SB_SAMPLES);
+
+    // 1. Pop 128 stereo PCM samples from `audio::PCM_RING` (or fallback synthesizer)
+    crate::audio::pop_pcm_128(pcm_lr, track_idx, sample_cursor);
+
+    // 2. Run 80-tap 8-Subband Polyphase Analysis Filterbank for 16 blocks × `num_ch` channels
+    let mut max_abs_sb = [[0u32; 8]; 2];
     for blk in 0..16 {
-        sb_samples[blk][0] = [0; 8];
-        sb_samples[blk][1] = [0; 8];
-    }
-    let step_samples: u32 = match track_idx {
-        0 => 14_336, // ~0.325s/note (ballad tempo for 七里香)
-        1 => 10_240, // ~0.232s/note (fast rhythmic tempo for 夜曲)
-        _ => 12_288, // ~0.278s/note (flowing tempo for 青花瓷)
-    };
-    let sr = sample_rate as u64;
+        let base_t = blk * 8;
+        for ch in 0..num_ch {
+            let x = &mut delay_x[ch];
+            // Shift delay line by 8 (`x[79..8] = x[71..0]`)
+            let mut idx = 79usize;
+            while idx >= 8 {
+                x[idx] = x[idx - 8];
+                idx -= 1;
+            }
+            // Insert 8 new PCM samples in reverse order (`x[0]` newest .. `x[7]` oldest)
+            for k in 0..8 {
+                x[k] = pcm_lr[ch][base_t + (7 - k)] as i32;
+            }
 
-    for blk in 0..16 {
-        let s_idx = *sample_cursor;
-        *sample_cursor = sample_cursor.wrapping_add(8);
+            // Window by 80-tap prototype filter H[0..79] and fold with (-1)^p into 16 values Y[0..15]
+            let mut y = [0i32; 16];
+            for i in 0..16 {
+                let acc = x[i] * SBC_PROTO_H80_Q15[i] - x[i + 16] * SBC_PROTO_H80_Q15[i + 16]
+                    + x[i + 32] * SBC_PROTO_H80_Q15[i + 32]
+                    - x[i + 48] * SBC_PROTO_H80_Q15[i + 48]
+                    + x[i + 64] * SBC_PROTO_H80_Q15[i + 64];
+                y[i] = acc >> 15;
+            }
 
-        let note_step = ((s_idx / step_samples) as usize) & 31;
-        let note_pos = s_idx % step_samples;
-
-        let (f_mel, f_chd, f_bas) = match track_idx {
-            0 => (
-                QILIXIANG_MELODY[note_step] as u64,
-                QILIXIANG_CHORD[note_step] as u64,
-                QILIXIANG_BASS[note_step] as u64,
-            ),
-            1 => (
-                YEQU_MELODY[note_step] as u64,
-                YEQU_CHORD[note_step] as u64,
-                YEQU_BASS[note_step] as u64,
-            ),
-            _ => (
-                QINGHUACI_MELODY[note_step] as u64,
-                QINGHUACI_CHORD[note_step] as u64,
-                QINGHUACI_BASS[note_step] as u64,
-            ),
-        };
-
-        // Smooth electric-piano ADSR envelope (soft 8ms attack + natural decay)
-        let env: i32 = if note_pos < 360 {
-            ((note_pos * 256) / 360) as i32
-        } else {
-            let decay = ((note_pos - 360) * 145) / step_samples;
-            (256i32 - decay as i32).max(95)
-        };
-
-        // Advance continuous Q24 phase accumulators (`8` PCM samples per SBC block) so note changes NEVER click/pop!
-        A2DP_PHASE_MEL =
-            A2DP_PHASE_MEL.wrapping_add(((f_mel * 8 * (1 << 24)) / sr) as u32);
-        A2DP_PHASE_CHD =
-            A2DP_PHASE_CHD.wrapping_add(((f_chd * 8 * (1 << 24)) / sr) as u32);
-        A2DP_PHASE_BAS =
-            A2DP_PHASE_BAS.wrapping_add(((f_bas * 8 * (1 << 24)) / sr) as u32);
-
-        let p_mel = (A2DP_PHASE_MEL >> 16) as u8;
-        let p_mel2 = p_mel.wrapping_mul(2);
-        let p_chd = (A2DP_PHASE_CHD >> 16) as u8;
-        let p_bas = (A2DP_PHASE_BAS >> 16) as u8;
-
-        let mel_wave = (fast_sin(p_mel) * 5 + fast_sin(p_mel2) * 2) * env / (7 * 256);
-        let chd_wave = (fast_sin(p_chd) * (env + 128)) / 512;
-        let bas_wave = fast_sin(p_bas);
-
-        let left_sb0 = (mel_wave * 4 + chd_wave * 2 + bas_wave * 2).clamp(-7500, 7500);
-        let right_sb0 = (mel_wave * 4 + chd_wave * 3 + bas_wave).clamp(-7500, 7500);
-
-        sb_samples[blk][0][0] = left_sb0;
-        sb_samples[blk][1][0] = right_sb0;
+            // Multiply by 8x16 Cosine Analysis Matrix to obtain 8 subband samples
+            for sb in 0..8 {
+                let m_row = &SBC_COS_M8_Q13[sb];
+                let mut sum = 0i32;
+                for i in 0..16 {
+                    sum += m_row[i] * y[i];
+                }
+                let s_val = (sum >> 13).clamp(-32767, 32767);
+                sb_samples[blk][ch][sb] = s_val;
+                let a = s_val.unsigned_abs();
+                if a > max_abs_sb[ch][sb] {
+                    max_abs_sb[ch][sb] = a;
+                }
+            }
+        }
     }
 
-    // Set `scale_factor[ch][0] = 12` (`2^13 = 8192` full scale) and `scale_factor[ch][1] = 2`
+    // 3. Compute dynamic `scale_factor[ch][0..7]` (`0..15`) from peak subband magnitude
     let mut scale_factor = [[0i32; 8]; 2];
     for ch in 0..num_ch {
-        scale_factor[ch][0] = 12;
-        scale_factor[ch][1] = 2;
+        for sb in 0..8 {
+            let m = max_abs_sb[ch][sb];
+            scale_factor[ch][sb] = if m <= 1 {
+                0
+            } else {
+                (31 - m.leading_zeros()).min(15) as i32
+            };
+        }
     }
 
     let mut bits = [[0i32; 8]; 2];

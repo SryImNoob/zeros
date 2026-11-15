@@ -304,6 +304,16 @@ impl DesktopShell {
         }
     }
 
+    /// Poll for AVRCP remote control button actions sent by the Bluetooth speaker.
+    pub fn poll_avrcp(&mut self) {
+        if let Some(act) = bluetooth::take_avrcp_action() {
+            self.music_app.handle_avrcp(act);
+            if self.active_app == AppId::Music {
+                self.needs_full_redraw = true;
+            }
+        }
+    }
+
     /// Periodic tick called every ~200ms (`sub_tick` increments at 5Hz; `sub_tick % 5 == 0` is 1Hz).
     pub fn tick_200ms(&mut self, sub_tick: u32) {
         let active = self.active_app;
@@ -340,7 +350,9 @@ pub fn ui_task() {
         if !crate::bsp::is_qemu() {
             tryboot::watchdog_feed(15);
         }
+        crate::audio::refill_pcm_ring();
         bluetooth::pump_a2dp_audio();
+        shell.poll_avrcp();
 
         if let Some((tx, ty)) = touch::poll_touch() {
             input::push_event(InputEvent::Touch(tx, ty));
@@ -351,6 +363,7 @@ pub fn ui_task() {
         }
 
         shell.render();
+        crate::audio::refill_pcm_ring();
         bluetooth::pump_a2dp_audio();
 
         task::sleep_ms(10);

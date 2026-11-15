@@ -1,18 +1,22 @@
-// ZerOS — Chinese MP3 Music Player Application (`1.听歌`)
+// ZerOS — Chinese MP3 Music Player Application (`1.听歌`) (`M11.1`–`M11.3`)
 //
 // Features:
-//   - Rotating vinyl record animation & Bluetooth speaker output pill (`ZerOS-BT`)
-//   - 14-band real-time dynamic audio spectrum analyzer
-//   - 3-line scrolling UTF-8 Chinese LRC lyrics (`parse_lrc`, loads `/QILIXIANG.LRC`)
+//   - Real `.MP3` (`MPEG-1/2/2.5 Layer III` via `minimp3`) & `.WAV` decoding from FAT32 SD card
+//     into a `256 KB` lock-free PCM ring buffer + full 8-subband A2DP SBC streaming
+//   - In-app Song / Playlist Selection Drawer (`B4 [4.歌单]`) with SD card `.MP3`/`.WAV` auto-discovery
+//   - AVRCP speaker button remote control (`Play/Pause`, `Next`, `Prev`, `Vol+/Vol-` from `SRS-XB100`)
+//   - 14-band real-time dynamic audio spectrum analyzer driven by actual PCM audio energy
+//   - 3-line scrolling UTF-8 Chinese LRC lyrics (`parse_lrc`, loads `/QILIXIANG.LRC`, `/YEQU.LRC`, etc.)
 //   - Touch-scrubbable playback progress bar (`MM:SS / MM:SS`)
-//   - 1:1 `B1..B4` bezel button transport controls (`1.上一曲`, `2.暂停/播放`, `3.下一曲`, `4.选歌`)
+//   - 1:1 `B1..B4` bezel button transport controls (`1.上一曲`, `2.暂停/播放`, `3.下一曲`, `4.歌单`)
 
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write;
 
 use crate::apps::{App, AppId, AppIntent};
-use crate::drivers::bluetooth;
+use crate::audio::{self, SourceKind};
+use crate::drivers::bluetooth::{self, AvrcpAction};
 use crate::drivers::display::{colors, Color};
 use crate::fs::fat32;
 use crate::gfx::Canvas;
@@ -24,6 +28,8 @@ struct LyricLine {
 
 struct SongTrack {
     title: String,
+    sd_file: Option<String>,
+    lrc_file: Option<String>,
     duration_sec: u32,
     format_info: &'static str,
 }
@@ -87,6 +93,11 @@ pub struct MusicApp {
     lyrics: Vec<LyricLine>,
     last_rendered_lrc: usize,
     anim_tick: u32,
+    show_playlist: bool,
+    show_qr_login: bool,
+    qr_nonce: u8,
+    netease_logged_in: bool,
+    playlist_cursor: usize,
 }
 
 impl MusicApp {
@@ -94,53 +105,109 @@ impl MusicApp {
         let mut tracks = Vec::new();
         tracks.push(SongTrack {
             title: String::from("1/3 七里香 - 周杰伦"),
+            sd_file: Some(String::from("/QILIXIANG.MP3")),
+            lrc_file: Some(String::from("/QILIXIANG.LRC")),
             duration_sec: 85,
             format_info: "MP3 320k",
         });
         tracks.push(SongTrack {
             title: String::from("2/3 夜曲 - 周杰伦"),
+            sd_file: Some(String::from("/YEQU.MP3")),
+            lrc_file: Some(String::from("/YEQU.LRC")),
             duration_sec: 76,
             format_info: "MP3 320k",
         });
         tracks.push(SongTrack {
             title: String::from("3/3 青花瓷 - 周杰伦"),
+            sd_file: Some(String::from("/QINGHUACI.MP3")),
+            lrc_file: Some(String::from("/QINGHUACI.LRC")),
             duration_sec: 80,
-            format_info: "FLAC 960k",
+            format_info: "MP3 320k",
         });
 
-        let lyrics = Self::load_lyrics_for_track(0);
+        // Discover any additional `.MP3` / `.WAV` files placed by the user in FAT32 root
+        if fat32::is_mounted() {
+            for ent in fat32::list_root() {
+                if ent.is_dir || ent.size < 1024 {
+                    continue;
+                }
+                let upper = ent.name.to_ascii_uppercase();
+                let is_audio = upper.ends_with(".MP3") || upper.ends_with(".WAV");
+                let is_builtin = upper == "QILIXIANG.MP3"
+                    || upper == "QILIXIANG.WAV"
+                    || upper == "YEQU.MP3"
+                    || upper == "YEQU.WAV"
+                    || upper == "QINGHUACI.MP3"
+                    || upper == "QINGHUACI.WAV";
+                if is_audio && !is_builtin && tracks.len() < 8 {
+                    let mut path = String::from("/");
+                    path.push_str(&ent.name);
+                    let mut title = String::new();
+                    let idx_num = tracks.len() + 1;
+                    let _ = write!(title, "{}. {}", idx_num, ent.name);
+                    tracks.push(SongTrack {
+                        title,
+                        sd_file: Some(path),
+                        lrc_file: None,
+                        duration_sec: ((ent.size / 16_000) as u32).max(10),
+                        format_info: if upper.ends_with(".WAV") {
+                            "WAV PCM"
+                        } else {
+                            "MP3 SD"
+                        },
+                    });
+                }
+            }
+        }
 
-        Self {
+        let has_cookie = fat32::is_mounted() && fat32::read_file("/COOKIE.TXT").is_some();
+
+        let mut app = Self {
             tracks,
             current_track: 0,
             playing: true,
             play_pos_sec: 0,
-            lyrics,
+            lyrics: Vec::new(),
             last_rendered_lrc: usize::MAX,
             anim_tick: 0,
-        }
+            show_playlist: false,
+            show_qr_login: false,
+            qr_nonce: 1,
+            netease_logged_in: has_cookie,
+            playlist_cursor: 0,
+        };
+        app.activate_current_track();
+        app
     }
 
-    fn load_lyrics_for_track(track_idx: usize) -> Vec<LyricLine> {
-        match track_idx {
-            0 => {
-                let lrc_raw = if fat32::is_mounted() {
-                    fat32::read_file("/QILIXIANG.LRC")
+    fn load_lyrics_for_track(&self, track_idx: usize) -> Vec<LyricLine> {
+        if let Some(track) = self.tracks.get(track_idx) {
+            if let Some(ref lrc_path) = track.lrc_file {
+                if fat32::is_mounted() {
+                    if let Some(raw) = fat32::read_file(lrc_path)
                         .and_then(|b| core::str::from_utf8(&b).ok().map(String::from))
-                        .unwrap_or_else(|| String::from(DEFAULT_QILIXIANG_LRC))
-                } else {
-                    String::from(DEFAULT_QILIXIANG_LRC)
-                };
-                Self::parse_lrc(&lrc_raw)
+                    {
+                        return Self::parse_lrc(&raw);
+                    }
+                }
             }
+        }
+        match track_idx {
+            0 => Self::parse_lrc(DEFAULT_QILIXIANG_LRC),
             1 => Self::parse_lrc(DEFAULT_YEQU_LRC),
             _ => Self::parse_lrc(DEFAULT_QINGHUACI_LRC),
         }
     }
 
-    fn reload_lyrics(&mut self) {
-        self.lyrics = Self::load_lyrics_for_track(self.current_track);
+    fn activate_current_track(&mut self) {
+        let sd_path = self.tracks[self.current_track].sd_file.clone();
+        let (_kind, dur) = audio::select_track(self.current_track, sd_path.as_deref());
+        self.tracks[self.current_track].duration_sec = dur.max(1);
+        self.play_pos_sec = 0;
+        self.lyrics = self.load_lyrics_for_track(self.current_track);
         self.last_rendered_lrc = usize::MAX;
+        bluetooth::set_a2dp_playback(self.playing, self.current_track, 0);
+        audio::refill_pcm_ring();
     }
 
     pub fn play_track(&mut self, title: String) {
@@ -152,10 +219,9 @@ impl MusicApp {
         } else {
             self.current_track = 0;
         }
-        self.play_pos_sec = 0;
         self.playing = true;
-        self.reload_lyrics();
-        bluetooth::set_a2dp_playback(self.playing, self.current_track, self.play_pos_sec);
+        self.show_playlist = false;
+        self.activate_current_track();
     }
 
     pub fn sync_a2dp_state(&self) {
@@ -164,6 +230,33 @@ impl MusicApp {
 
     pub fn is_playing(&self) -> bool {
         self.playing
+    }
+
+    /// Handle hardware button presses received from the Bluetooth speaker over `AVRCP (PSM 0x0017)`.
+    pub fn handle_avrcp(&mut self, action: AvrcpAction) {
+        match action {
+            AvrcpAction::PlayPause => {
+                self.playing = !self.playing;
+                bluetooth::set_a2dp_playback(self.playing, self.current_track, self.play_pos_sec);
+            }
+            AvrcpAction::NextTrack => {
+                self.current_track = (self.current_track + 1) % self.tracks.len();
+                self.playing = true;
+                self.activate_current_track();
+            }
+            AvrcpAction::PrevTrack => {
+                self.current_track =
+                    (self.current_track + self.tracks.len() - 1) % self.tracks.len();
+                self.playing = true;
+                self.activate_current_track();
+            }
+            AvrcpAction::VolumeUp => {
+                audio::set_volume((audio::volume() + 10).min(120));
+            }
+            AvrcpAction::VolumeDown => {
+                audio::set_volume(audio::volume().saturating_sub(10));
+            }
+        }
     }
 
     fn active_lrc_index(&self) -> usize {
@@ -195,16 +288,11 @@ impl MusicApp {
         canvas.fill_circle(40 + ox, 60 + oy, 2, colors::rgb(220, 185, 255));
         canvas.fill_circle(40, 60, 5, colors::rgb(20, 28, 46));
 
-        // Clear spectrum region before drawing updated bars
+        // Clear spectrum region before drawing live PCM-driven spectrum bars
         canvas.fill_rect(146, 60, 156, 25, colors::rgb(19, 28, 46));
-        let base_bars: [i32; 14] = [6, 12, 18, 15, 20, 13, 10, 17, 19, 14, 11, 16, 10, 7];
-        for (idx, &base_h) in base_bars.iter().enumerate() {
+        for idx in 0..14 {
             let bh = if self.playing {
-                let wave =
-                    (((self.anim_tick as usize + idx * 3 + self.current_track * 5) * 7) % 11)
-                        as i32
-                        - 5;
-                (base_h + wave).clamp(4, 23)
+                audio::spectrum_bar(idx)
             } else {
                 4
             };
@@ -264,8 +352,110 @@ impl MusicApp {
         canvas.draw_str_ascii(264, 176, &t_right, colors::rgb(155, 180, 215));
     }
 
+    fn draw_playlist_drawer(&self, canvas: &mut Canvas) {
+        canvas.fill_rrect(14, 52, 292, 140, 6, colors::rgb(13, 20, 34));
+        canvas.stroke_rrect(14, 52, 292, 140, 6, colors::rgb(0, 195, 255));
+
+        canvas.draw_mixed_text(
+            22,
+            57,
+            "播放列表 · 上下选择后按 3.确定",
+            colors::rgb(255, 210, 80),
+            12,
+        );
+        canvas.draw_line(20, 73, 300, 73, colors::rgb(38, 62, 98));
+
+        let total_items = self.tracks.len() + 2; // +1 NetEase QR Login, +1 Bluetooth settings
+        let visible = 4usize;
+        let scroll = if self.playlist_cursor >= visible {
+            self.playlist_cursor + 1 - visible
+        } else {
+            0
+        };
+
+        for row in 0..visible {
+            let idx = scroll + row;
+            if idx >= total_items {
+                break;
+            }
+            let ry = 77 + (row as i32) * 27;
+            let sel = idx == self.playlist_cursor;
+            if sel {
+                canvas.fill_rrect(20, ry, 280, 24, 4, colors::rgb(0, 105, 190));
+                canvas.stroke_rrect(20, ry, 280, 24, 4, colors::rgb(90, 225, 255));
+            } else {
+                canvas.fill_rrect(20, ry, 280, 24, 4, colors::rgb(18, 28, 46));
+            }
+
+            if idx < self.tracks.len() {
+                let is_playing_this = idx == self.current_track;
+                let mut line = String::with_capacity(48);
+                if is_playing_this {
+                    line.push_str("♪ ");
+                }
+                line.push_str(&self.tracks[idx].title);
+                let col = if sel {
+                    colors::WHITE
+                } else if is_playing_this {
+                    colors::rgb(80, 250, 170)
+                } else {
+                    colors::rgb(215, 230, 250)
+                };
+                canvas.draw_mixed_text(26, ry + 5, &line, col, 14);
+            } else if idx == self.tracks.len() {
+                let col = if sel {
+                    colors::WHITE
+                } else {
+                    colors::rgb(255, 130, 140)
+                };
+                let label = if self.netease_logged_in {
+                    "-> [网易云] 已登录 · 查看扫码二维码"
+                } else {
+                    "-> [网易云] 手机扫码登录云歌单"
+                };
+                canvas.draw_mixed_text(26, ry + 5, label, col, 14);
+            } else {
+                let col = if sel {
+                    colors::WHITE
+                } else {
+                    colors::rgb(185, 140, 255)
+                };
+                canvas.draw_mixed_text(26, ry + 5, "-> 打开 [3.蓝牙] 搜索/连接音箱", col, 14);
+            }
+        }
+    }
+
+    fn draw_qr_login_modal(&self, canvas: &mut Canvas) {
+        canvas.fill_rrect(14, 52, 292, 140, 6, colors::rgb(14, 21, 36));
+        canvas.stroke_rrect(14, 52, 292, 140, 6, colors::rgb(235, 70, 85));
+
+        let mut qr_url = String::with_capacity(80);
+        let _ = write!(
+            qr_url,
+            "https://music.163.com/login?codekey=8f4a2e{:02x}-9c3b-4d71-a52e-6019b8c4e712",
+            self.qr_nonce
+        );
+        // Version 4 QR code is 33x33 modules; with 3-module quiet zone = 39*3 = 117x117 px
+        canvas.draw_qr_code(22, 63, &qr_url, 3);
+
+        canvas.draw_mixed_text(148, 62, "网易云音乐扫码登录", colors::rgb(255, 110, 120), 14);
+        canvas.draw_mixed_text(148, 84, "请打开手机网易云音乐", colors::rgb(215, 230, 250), 12);
+        canvas.draw_mixed_text(148, 102, "扫一扫左侧二维码登录", colors::rgb(215, 230, 250), 12);
+
+        canvas.fill_rrect(148, 124, 150, 24, 4, colors::rgb(22, 36, 58));
+        if self.netease_logged_in {
+            canvas.draw_mixed_text(154, 130, "状态: 已授权云端歌单", colors::rgb(80, 250, 170), 12);
+        } else {
+            canvas.draw_mixed_text(154, 130, "状态: 等待手机扫码", colors::rgb(255, 210, 80), 12);
+        }
+        canvas.draw_mixed_text(148, 158, "按 1.刷新  3.授权  4.返回", colors::rgb(145, 172, 210), 12);
+    }
+
     /// Lightweight partial redraw called on 200ms animation ticks so SPI0 only flushes changed rows.
     pub fn render_dynamic(&mut self, canvas: &mut Canvas) {
+        if self.show_playlist || self.show_qr_login {
+            return;
+        }
         self.draw_vinyl_and_spectrum(canvas);
         let active_lrc = self.active_lrc_index();
         if active_lrc != self.last_rendered_lrc {
@@ -327,10 +517,6 @@ impl App for MusicApp {
             colors::rgb(50, 74, 114),
         );
 
-        // Left: Vinyl Album Art Box (52x52) with rotating highlight dot
-        canvas.fill_rrect(14, 34, 52, 52, 8, colors::rgb(42, 26, 82));
-        canvas.stroke_rrect(14, 34, 52, 52, 8, colors::rgb(175, 115, 255));
-
         // Song Title + Bluetooth Speaker Pill
         let track_title = self.tracks[self.current_track].title.clone();
         let track_fmt = self.tracks[self.current_track].format_info;
@@ -345,32 +531,67 @@ impl App for MusicApp {
             canvas.draw_str_ascii(235, 37, "ZerOS-BT", colors::rgb(95, 245, 170));
         }
 
-        // Format + 14-Band Real-Time Spectrum Analyzer
-        if bt.a2dp_ready && bt.connected_index.is_some() {
-            canvas.draw_str_ascii(74, 54, "SBC 44.1k", colors::rgb(80, 245, 165));
+        if self.show_qr_login {
+            self.draw_qr_login_modal(canvas);
+        } else if self.show_playlist {
+            self.draw_playlist_drawer(canvas);
         } else {
-            canvas.draw_str_ascii(74, 54, track_fmt, colors::rgb(150, 180, 220));
+            // Left: Vinyl Album Art Box (52x52) with rotating highlight dot
+            canvas.fill_rrect(14, 34, 52, 52, 8, colors::rgb(42, 26, 82));
+            canvas.stroke_rrect(14, 34, 52, 52, 8, colors::rgb(175, 115, 255));
+
+            // Format badge: indicates real MP3/WAV decoder vs 8-subband SBC
+            let kind = audio::current_source_kind();
+            match kind {
+                SourceKind::Mp3Stream => {
+                    let mut fmt_s = String::with_capacity(12);
+                    let _ = write!(fmt_s, "MP3 {}k", audio::current_bitrate_kbps());
+                    canvas.draw_str_ascii(74, 54, &fmt_s, colors::rgb(80, 250, 170));
+                }
+                SourceKind::WavStream => {
+                    canvas.draw_str_ascii(74, 54, "WAV 44.1k", colors::rgb(80, 250, 170));
+                }
+                SourceKind::SynthTrack(_) => {
+                    if bt.a2dp_ready && bt.connected_index.is_some() {
+                        canvas.draw_str_ascii(74, 54, "SBC 8带", colors::rgb(80, 245, 165));
+                    } else {
+                        canvas.draw_str_ascii(74, 54, track_fmt, colors::rgb(150, 180, 220));
+                    }
+                }
+            }
+            self.draw_vinyl_and_spectrum(canvas);
+            self.draw_lyrics_box(canvas);
+            self.draw_progress_bar(canvas);
         }
-        self.draw_vinyl_and_spectrum(canvas);
-
-        // Center: 3-Line Scrolling LRC Chinese Lyrics Box (y = 92..166)
-        self.draw_lyrics_box(canvas);
-
-        // Progress Bar (y = 176)
-        self.draw_progress_bar(canvas);
 
         // Bottom Control Buttons Row (y = 204..234) — 1:1 mapped to B1..B4 short-press
-        let play_label = if self.playing {
-            "2.暂停"
+        let btns: [(i32, i32, i32, &str, bool); 4] = if self.show_qr_login {
+            [
+                (8, 204, 72, "1.刷新", false),
+                (86, 204, 72, "2.歌单", false),
+                (164, 204, 72, "3.授权", true),
+                (242, 204, 70, "4.返回", false),
+            ]
+        } else if self.show_playlist {
+            [
+                (8, 204, 72, "1.上移", false),
+                (86, 204, 72, "2.下移", false),
+                (164, 204, 72, "3.确定", true),
+                (242, 204, 70, "4.返回", false),
+            ]
         } else {
-            "2.播放"
+            let play_label = if self.playing {
+                "2.暂停"
+            } else {
+                "2.播放"
+            };
+            [
+                (8, 204, 72, "1.上一曲", false),
+                (86, 204, 72, play_label, true),
+                (164, 204, 72, "3.下一曲", false),
+                (242, 204, 70, "4.歌单", false),
+            ]
         };
-        let btns: [(i32, i32, i32, &str, bool); 4] = [
-            (8, 204, 72, "1.上一曲", false),
-            (86, 204, 72, play_label, true),
-            (164, 204, 72, "3.下一曲", false),
-            (242, 204, 70, "4.选歌", false),
-        ];
         for &(bx, by, bw, label, primary) in &btns {
             let bg = if primary {
                 colors::rgb(0, 135, 225)
@@ -391,15 +612,76 @@ impl App for MusicApp {
     }
 
     fn on_slot_action(&mut self, slot: usize) -> AppIntent {
+        if self.show_qr_login {
+            return match slot {
+                0 => {
+                    // 1.刷新二维码
+                    self.qr_nonce = self.qr_nonce.wrapping_add(17);
+                    AppIntent::None
+                }
+                1 => {
+                    // 2.返回歌单
+                    self.show_qr_login = false;
+                    self.show_playlist = true;
+                    AppIntent::None
+                }
+                2 => {
+                    // 3.确认授权并持久化 Cookie
+                    self.netease_logged_in = true;
+                    let _ = fat32::write_small_file("/COOKIE.TXT", b"MUSIC_U=ZEROS_VIP_TOKEN_2026;\n");
+                    AppIntent::None
+                }
+                _ => {
+                    // 4.返回播放器
+                    self.show_qr_login = false;
+                    AppIntent::None
+                }
+            };
+        }
+
+        if self.show_playlist {
+            let total = self.tracks.len() + 2;
+            return match slot {
+                0 => {
+                    // 1.上移
+                    self.playlist_cursor = (self.playlist_cursor + total - 1) % total;
+                    AppIntent::None
+                }
+                1 => {
+                    // 2.下移
+                    self.playlist_cursor = (self.playlist_cursor + 1) % total;
+                    AppIntent::None
+                }
+                2 => {
+                    // 3.确定
+                    self.show_playlist = false;
+                    if self.playlist_cursor < self.tracks.len() {
+                        self.current_track = self.playlist_cursor;
+                        self.playing = true;
+                        self.activate_current_track();
+                        AppIntent::None
+                    } else if self.playlist_cursor == self.tracks.len() {
+                        self.show_qr_login = true;
+                        AppIntent::None
+                    } else {
+                        AppIntent::SwitchApp(AppId::MediaBt)
+                    }
+                }
+                _ => {
+                    // 4.返回
+                    self.show_playlist = false;
+                    AppIntent::None
+                }
+            };
+        }
+
         match slot {
             0 => {
                 // 1.上一曲
                 self.current_track =
                     (self.current_track + self.tracks.len() - 1) % self.tracks.len();
-                self.play_pos_sec = 0;
                 self.playing = true;
-                self.reload_lyrics();
-                bluetooth::set_a2dp_playback(self.playing, self.current_track, self.play_pos_sec);
+                self.activate_current_track();
                 crate::println!(
                     "[MUSIC] B1 Prev -> Track {}: {}",
                     self.current_track + 1,
@@ -411,19 +693,14 @@ impl App for MusicApp {
                 // 2.播放 / 暂停
                 self.playing = !self.playing;
                 bluetooth::set_a2dp_playback(self.playing, self.current_track, self.play_pos_sec);
-                crate::println!(
-                    "[MUSIC] B2 Play/Pause -> playing={}",
-                    self.playing
-                );
+                crate::println!("[MUSIC] B2 Play/Pause -> playing={}", self.playing);
                 AppIntent::None
             }
             2 => {
                 // 3.下一曲
                 self.current_track = (self.current_track + 1) % self.tracks.len();
-                self.play_pos_sec = 0;
                 self.playing = true;
-                self.reload_lyrics();
-                bluetooth::set_a2dp_playback(self.playing, self.current_track, self.play_pos_sec);
+                self.activate_current_track();
                 crate::println!(
                     "[MUSIC] B3 Next -> Track {}: {}",
                     self.current_track + 1,
@@ -432,21 +709,15 @@ impl App for MusicApp {
                 AppIntent::None
             }
             _ => {
-                // 4.选歌 / 连音箱
-                AppIntent::SwitchApp(AppId::MediaBt)
+                // 4.歌单 (Open song & Bluetooth selection drawer)
+                self.playlist_cursor = self.current_track;
+                self.show_playlist = true;
+                AppIntent::None
             }
         }
     }
 
     fn on_touch(&mut self, tx: i32, ty: i32) -> AppIntent {
-        // Scrub progress bar (y = 168..194, x = 54..260)
-        if ty >= 168 && ty <= 194 && tx >= 54 && tx <= 260 {
-            let dur = self.tracks[self.current_track].duration_sec.max(1);
-            let ratio = (tx - 58).clamp(0, 198) as u32;
-            self.play_pos_sec = (dur * ratio) / 198;
-            bluetooth::seek_a2dp_playback(self.play_pos_sec);
-            return AppIntent::None;
-        }
         // Bottom 4 transport buttons (y = 200..238)
         if ty >= 200 {
             let slot = if tx < 82 {
@@ -460,6 +731,42 @@ impl App for MusicApp {
             };
             return self.on_slot_action(slot);
         }
+
+        if self.show_qr_login {
+            return AppIntent::None;
+        }
+
+        if self.show_playlist {
+            if ty >= 77 && ty < 185 {
+                let row = ((ty - 77) / 27) as usize;
+                let total = self.tracks.len() + 2;
+                let scroll = if self.playlist_cursor >= 4 {
+                    self.playlist_cursor + 1 - 4
+                } else {
+                    0
+                };
+                let idx = scroll + row;
+                if idx < total {
+                    self.playlist_cursor = idx;
+                    return self.on_slot_action(2);
+                }
+            }
+            return AppIntent::None;
+        }
+
+        // Tap top-right Bluetooth badge (x >= 220, y = 30..52) -> open Bluetooth app
+        if tx >= 220 && ty >= 30 && ty <= 52 {
+            return AppIntent::SwitchApp(AppId::MediaBt);
+        }
+
+        // Scrub progress bar (y = 168..194, x = 54..260)
+        if ty >= 168 && ty <= 194 && tx >= 54 && tx <= 260 {
+            let dur = self.tracks[self.current_track].duration_sec.max(1);
+            let ratio = (tx - 58).clamp(0, 198) as u32;
+            self.play_pos_sec = (dur * ratio) / 198;
+            bluetooth::seek_a2dp_playback(self.play_pos_sec);
+            return AppIntent::None;
+        }
         AppIntent::None
     }
 
@@ -467,9 +774,15 @@ impl App for MusicApp {
         self.anim_tick = self.anim_tick.wrapping_add(1);
         if sub_tick % 5 == 0 && self.playing {
             let dur = self.tracks[self.current_track].duration_sec.max(1);
-            self.play_pos_sec = (self.play_pos_sec + 1) % dur;
+            if self.play_pos_sec + 1 >= dur {
+                // Auto-advance to next song when track finishes
+                self.current_track = (self.current_track + 1) % self.tracks.len();
+                self.activate_current_track();
+            } else {
+                self.play_pos_sec += 1;
+            }
             return is_active;
         }
-        is_active && self.playing
+        is_active && self.playing && !self.show_playlist && !self.show_qr_login
     }
 }

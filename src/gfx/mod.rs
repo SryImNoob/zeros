@@ -12,6 +12,7 @@
 #![allow(dead_code)]
 
 pub mod cjk_font_data;
+pub mod qrcode;
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -622,6 +623,36 @@ impl Canvas {
             }
         }
         cx - x
+    }
+
+    /// Render a high-contrast ISO/IEC 18004 QR Code with a 4-module white quiet zone
+    /// at top-left `(x, y)` using `scale` pixels per module (`3` or `4` px).
+    /// Returns the total rendered square side length in pixels (`0` if `text` is too long).
+    pub fn draw_qr_code(&mut self, x: i32, y: i32, text: &str, scale: i32) -> i32 {
+        let qr = match qrcode::QrCode::encode_bytes(text.as_bytes()) {
+            Some(q) => q,
+            None => return 0,
+        };
+        let scale = scale.max(1);
+        let quiet = 3; // 3-module quiet zone around QR matrix
+        let total_px = (qr.size as i32 + quiet * 2) * scale;
+        self.fill_rrect(x, y, total_px, total_px, 4, colors::WHITE);
+        let ox = x + quiet * scale;
+        let oy = y + quiet * scale;
+        for my in 0..qr.size {
+            for mx in 0..qr.size {
+                if qr.get_module(mx, my) {
+                    self.fill_rect(
+                        ox + (mx as i32) * scale,
+                        oy + (my as i32) * scale,
+                        scale,
+                        scale,
+                        colors::BLACK,
+                    );
+                }
+            }
+        }
+        total_px
     }
 }
 
