@@ -3594,10 +3594,10 @@ pub fn refill_sbc_pkt_ring() {
         return;
     }
 
-    for _ in 0..4 {
+    for _ in 0..12 {
         let r = SBC_PKT_READ.load(Ordering::Relaxed);
         let w = SBC_PKT_WRITE.load(Ordering::Relaxed);
-        if w.wrapping_sub(r) >= 12 {
+        if w.wrapping_sub(r) >= 14 {
             break;
         }
         let slot = w & SBC_PKT_RING_MASK;

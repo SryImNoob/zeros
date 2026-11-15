@@ -381,6 +381,13 @@ pub fn ui_task() {
             shell.handle_event(ev);
         }
 
+        // Top up PCM + pre-encoded SBC packet rings BEFORE `shell.render()` so that even if
+        // `handle_event` switched tracks / resumed playback (`clear_sbc_pkt_ring`) and triggered
+        // a 180ms full-screen SPI flush, the 100Hz Timer IRQ has 14 ready-made packets waiting!
+        crate::audio::refill_pcm_ring();
+        bluetooth::refill_sbc_pkt_ring();
+        bluetooth::pump_a2dp_audio();
+
         shell.render();
         crate::audio::refill_pcm_ring();
         bluetooth::refill_sbc_pkt_ring();

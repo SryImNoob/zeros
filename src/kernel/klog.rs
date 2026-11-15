@@ -198,7 +198,7 @@ pub fn record_irq_and_check_lockup(irq_us: u64, elr: u64, lr: u64) {
     }
 
     let streak = unsafe {
-        if irq_us >= 6_500 {
+        if irq_us >= 9_500 {
             LONG_IRQ_STREAK = LONG_IRQ_STREAK.saturating_add(1);
         } else {
             LONG_IRQ_STREAK = 0;
@@ -210,11 +210,9 @@ pub fn record_irq_and_check_lockup(irq_us: u64, elr: u64, lr: u64) {
     let last_hb = LAST_HEARTBEAT_TICK.load(Ordering::Relaxed);
     let stalled_ticks = now_tick.saturating_sub(last_hb);
 
-    // Trigger emergency lockup recovery if:
-    //   1) 20 consecutive Timer IRQs each took >= 6.5 ms (IRQ storm starving main thread), OR
-    //   2) Main thread (`ui_task`) has not called `klog::heartbeat()` for 450 ticks (4.5 seconds)
-    //      after system boot (`now_tick > 200`).
-    if streak >= 20 || (now_tick > 200 && stalled_ticks > 450) {
+    // Trigger emergency lockup recovery ONLY when the main thread (`ui_task`) has genuinely
+    // stalled for > 5.0 seconds (`500` ticks at 100Hz) after system boot (`now_tick > 200`).
+    if now_tick > 200 && stalled_ticks > 500 {
         LOCKUP_TRIGGERED.store(true, Ordering::Relaxed);
         crate::drivers::bluetooth::emergency_stop_a2dp();
         crate::println!(
